@@ -264,22 +264,6 @@ namespace DotNetCrawler
                             .Select(u => u.Name.ToString())
                             .ToHashSet();
 
-                        // Get all type identifiers used in the file
-                        var typeIdentifiers = root.DescendantNodes()
-                            .OfType<IdentifierNameSyntax>()
-                            .Select(i => i.Identifier.Text)
-                            .Where(t => !string.IsNullOrWhiteSpace(t) && char.IsUpper(t[0])) // Types typically start with uppercase
-                            .ToHashSet();
-
-                        // Also get generic names
-                        var genericNames = root.DescendantNodes()
-                            .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.GenericNameSyntax>()
-                            .Select(g => g.Identifier.Text)
-                            .Where(t => !string.IsNullOrWhiteSpace(t))
-                            .ToHashSet();
-
-                        typeIdentifiers.UnionWith(genericNames);
-
                         // Check if any package namespaces are used
                         foreach (var packageUsage in projectResult.PackageUsages)
                         {
@@ -293,13 +277,16 @@ namespace DotNetCrawler
                                 foreach (var ns in packageNamespacesInFile)
                                 {
                                     packageUsage.UsedNamespaces.Add(ns);
+                                    
+                                    if (!packageUsage.TypesByNamespace.ContainsKey(ns))
+                                    {
+                                        packageUsage.TypesByNamespace[ns] = new HashSet<string>();
+                                    }
                                 }
 
-                                // Add types used in this file (best effort - these are likely from the package)
-                                foreach (var type in typeIdentifiers)
-                                {
-                                    packageUsage.UsedTypes.Add(type);
-                                }
+                                // Find types that are likely from the package's namespaces
+                                // Look for: base types, object creation, type references with namespace prefix
+                                ExtractTypesFromNamespaces(root, packageNamespacesInFile, packageUsage);
 
                                 packageUsage.Files.Add(Path.GetFileName(csFile));
                             }
@@ -317,6 +304,168 @@ namespace DotNetCrawler
             return results;
         }
 
+        static HashSet<string> GetCommonSystemTypes()
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                // System types
+                "String", "Int32", "Int64", "Boolean", "DateTime", "TimeSpan", "Guid", "Decimal", "Double", "Float",
+                "Byte", "Char", "Object", "Void", "Exception", "Type", "Enum", "ValueType",
+                
+                // Collections
+                "List", "Dictionary", "HashSet", "IEnumerable", "ICollection", "IList", "IDictionary",
+                "Array", "ArrayList", "Queue", "Stack", "LinkedList", "SortedList", "SortedDictionary",
+                
+                // Generic types
+                "Tuple", "KeyValuePair", "Nullable", "Lazy",
+                
+                // LINQ method names (these get picked up as "types" incorrectly)
+                "Where", "Select", "SelectMany", "FirstOrDefault", "First", "LastOrDefault", "Last",
+                "Any", "All", "Count", "Sum", "Average", "Min", "Max", "OrderBy", "OrderByDescending",
+                "ThenBy", "ThenByDescending", "GroupBy", "Join", "Distinct", "Union", "Intersect",
+                "Except", "Take", "Skip", "ToList", "ToArray", "ToDictionary", "ToHashSet",
+                "Aggregate", "Contains", "SingleOrDefault", "Single",
+                
+                // Threading
+                "Task", "Thread", "CancellationToken", "CancellationTokenSource", "Semaphore", "Mutex",
+                
+                // IO
+                "Stream", "File", "Directory", "Path", "FileInfo", "DirectoryInfo", "StreamReader", "StreamWriter",
+                
+                // Common interfaces
+                "IDisposable", "IComparable", "IEquatable", "ICloneable", "IConvertible", "IFormatProvider",
+                
+                // Action/Func
+                "Action", "Func", "Predicate", "Delegate", "EventHandler",
+                
+                // Reflection
+                "MethodInfo", "PropertyInfo", "FieldInfo", "ConstructorInfo", "MemberInfo", "Assembly",
+                
+                // Text
+                "StringBuilder", "Encoding", "Regex", "Match",
+                
+                // XML/JSON
+                "XDocument", "XElement", "XAttribute", "JsonSerializer", "JsonConvert",
+                
+                // Common Microsoft types
+                "DbContext", "DbSet", "ILogger", "IConfiguration", "IServiceProvider", "IHostBuilder",
+                "HttpClient", "HttpRequest", "HttpResponse", "Controller", "ApiController",
+                
+                // Other common
+                "Console", "Math", "Convert", "Random", "Environment", "GC", "Uri", "Version",
+                "Attribute", "Obsolete", "Serializable",
+                
+                // Namespace-like identifiers that get picked up
+                "System", "Microsoft", "Collections", "Generic", "Linq", "Threading", "Tasks",
+                "Text", "IO", "Net", "Http", "Data", "Entity", "Core", "Web", "Mvc", "Api"
+            };
+        }
+
+        static void FilterCommonTypes(PackageUsageDetail packageUsage)
+        {
+            var commonTypes = GetCommonSystemTypes();
+            
+            // Filter UsedTypes
+            packageUsage.UsedTypes.RemoveWhere(t => commonTypes.Contains(t));
+            
+            // Filter TypesByNamespace
+            foreach (var ns in packageUsage.TypesByNamespace.Keys.ToList())
+            {
+                packageUsage.TypesByNamespace[ns].RemoveWhere(t => commonTypes.Contains(t));
+            }
+        }
+
+        static void ExtractTypesFromNamespaces(Microsoft.CodeAnalysis.SyntaxNode root, List<string> packageNamespaces, PackageUsageDetail packageUsage)
+        {
+            // Look for qualified names (e.g., Praxsys.SDS.Jobs.JobBase)
+            var qualifiedNames = root.DescendantNodes()
+                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.QualifiedNameSyntax>();
+
+            foreach (var qualifiedName in qualifiedNames)
+            {
+                var fullName = qualifiedName.ToString();
+                foreach (var ns in packageNamespaces)
+                {
+                    if (fullName.StartsWith(ns + ".", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var typeName = fullName.Substring(ns.Length + 1).Split('.')[0];
+                        if (!string.IsNullOrWhiteSpace(typeName))
+                        {
+                            packageUsage.TypesByNamespace[ns].Add(typeName);
+                            packageUsage.UsedTypes.Add(typeName);
+                        }
+                    }
+                }
+            }
+
+            // Look for member access expressions that might indicate types from the namespace
+            // This helps catch static method calls like SomeType.Method()
+            var memberAccess = root.DescendantNodes()
+                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax>();
+
+            foreach (var access in memberAccess)
+            {
+                var leftSide = access.Expression.ToString();
+                
+                // If the left side is a simple identifier starting with uppercase, it might be a type
+                if (!leftSide.Contains(".") && !string.IsNullOrWhiteSpace(leftSide) && 
+                    leftSide.Length > 0 && char.IsUpper(leftSide[0]))
+                {
+                    // Check if this could be from one of our namespaces (heuristic)
+                    // We'll add it to the first matching namespace that we've imported
+                    if (packageNamespaces.Any())
+                    {
+                        var firstNs = packageNamespaces[0];
+                        packageUsage.TypesByNamespace[firstNs].Add(leftSide);
+                        packageUsage.UsedTypes.Add(leftSide);
+                    }
+                }
+            }
+
+            // Look for object creation expressions (new SomeType())
+            var objectCreations = root.DescendantNodes()
+                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.ObjectCreationExpressionSyntax>();
+
+            foreach (var creation in objectCreations)
+            {
+                var typeName = creation.Type.ToString().Split('<')[0].Split('.').Last();
+                if (!string.IsNullOrWhiteSpace(typeName) && char.IsUpper(typeName[0]))
+                {
+                    // Add to the first matching namespace (best guess)
+                    if (packageNamespaces.Any())
+                    {
+                        var firstNs = packageNamespaces[0];
+                        packageUsage.TypesByNamespace[firstNs].Add(typeName);
+                        packageUsage.UsedTypes.Add(typeName);
+                    }
+                }
+            }
+
+            // Look for base types in class declarations
+            var classDeclarations = root.DescendantNodes()
+                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.ClassDeclarationSyntax>();
+
+            foreach (var classDecl in classDeclarations)
+            {
+                if (classDecl.BaseList != null)
+                {
+                    foreach (var baseType in classDecl.BaseList.Types)
+                    {
+                        var typeName = baseType.Type.ToString().Split('<')[0].Split('.').Last();
+                        if (!string.IsNullOrWhiteSpace(typeName) && char.IsUpper(typeName[0]))
+                        {
+                            if (packageNamespaces.Any())
+                            {
+                                var firstNs = packageNamespaces[0];
+                                packageUsage.TypesByNamespace[firstNs].Add(typeName);
+                                packageUsage.UsedTypes.Add(typeName);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         static void DisplayConsoleSummary(List<ProjectAnalysisResult> results)
         {
             Console.WriteLine("\n" + new string('=', 60));
@@ -332,6 +481,9 @@ namespace DotNetCrawler
 
                 foreach (var packageUsage in projectResult.PackageUsages)
                 {
+                    // Filter out common system types before displaying
+                    FilterCommonTypes(packageUsage);
+                    
                     Console.WriteLine($"\n  📦 {packageUsage.PackageName} (v{packageUsage.Version})");
                     Console.WriteLine($"     Namespaces: {packageUsage.UsedNamespaces.Count}");
                     Console.WriteLine($"     Types: {packageUsage.UsedTypes.Count}");
@@ -339,26 +491,26 @@ namespace DotNetCrawler
 
                     if (packageUsage.UsedNamespaces.Any())
                     {
-                        Console.WriteLine($"     Top Namespaces:");
-                        foreach (var ns in packageUsage.UsedNamespaces.Take(3))
+                        Console.WriteLine($"     Namespaces with Types:");
+                        foreach (var ns in packageUsage.UsedNamespaces.OrderBy(n => n))
                         {
-                            Console.WriteLine($"        - {ns}");
-                        }
-                        if (packageUsage.UsedNamespaces.Count > 3)
-                        {
-                            Console.WriteLine($"        ... and {packageUsage.UsedNamespaces.Count - 3} more");
-                        }
-
-                        if (packageUsage.UsedTypes.Any())
-                        {
-                            Console.WriteLine($"     Top Types Used:");
-                            foreach (var type in packageUsage.UsedTypes.OrderBy(t => t).Take(5))
+                            Console.WriteLine($"        📋 {ns}");
+                            
+                            if (packageUsage.TypesByNamespace.ContainsKey(ns) && packageUsage.TypesByNamespace[ns].Any())
                             {
-                                Console.WriteLine($"        - {type}");
+                                var types = packageUsage.TypesByNamespace[ns].OrderBy(t => t).Take(5).ToList();
+                                foreach (var type in types)
+                                {
+                                    Console.WriteLine($"           - {type}");
+                                }
+                                if (packageUsage.TypesByNamespace[ns].Count > 5)
+                                {
+                                    Console.WriteLine($"           ... and {packageUsage.TypesByNamespace[ns].Count - 5} more");
+                                }
                             }
-                            if (packageUsage.UsedTypes.Count > 5)
+                            else
                             {
-                                Console.WriteLine($"        ... and {packageUsage.UsedTypes.Count - 5} more");
+                                Console.WriteLine($"           (namespace imported, no specific types detected)");
                             }
                         }
                     }
@@ -428,7 +580,10 @@ namespace DotNetCrawler
 
             // Summary section
             var totalProjects = results.Count;
-            var totalPackages = results.SelectMany(r => r.PackageUsages).Select(p => p.PackageName).Distinct().Count();
+            var totalPackages = results.SelectMany(r => r.PackageUsages)
+                .Select(p => p.PackageName)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Count();
             var totalNamespaces = results.SelectMany(r => r.PackageUsages).SelectMany(p => p.UsedNamespaces).Distinct().Count();
             var totalTypes = results.SelectMany(r => r.PackageUsages).SelectMany(p => p.UsedTypes).Distinct().Count();
             var unusedPackages = results.SelectMany(r => r.PackageUsages).Count(p => !p.UsedNamespaces.Any());
@@ -462,6 +617,9 @@ namespace DotNetCrawler
 
                 foreach (var package in project.PackageUsages.OrderBy(p => p.PackageName))
                 {
+                    // Filter out common system types before rendering
+                    FilterCommonTypes(package);
+                    
                     var isUnused = !package.UsedNamespaces.Any();
                     var packageId = $"{project.ProjectName}-{package.PackageName}".Replace(".", "-");
 
@@ -486,23 +644,25 @@ namespace DotNetCrawler
                     }
                     else
                     {
-                        html.AppendLine("                        <div class='section-header'>📋 Used Namespaces:</div>");
-                        html.AppendLine("                        <ul class='namespace-list'>");
+                        // Group and display by namespace
                         foreach (var ns in package.UsedNamespaces.OrderBy(n => n))
                         {
-                            html.AppendLine($"                            <li class='namespace-item'>{ns}</li>");
-                        }
-                        html.AppendLine("                        </ul>");
-
-                        if (package.UsedTypes.Any())
-                        {
-                            html.AppendLine("                        <div class='section-header'>🔷 Types Used:</div>");
-                            html.AppendLine("                        <ul class='type-list'>");
-                            foreach (var type in package.UsedTypes.OrderBy(t => t))
+                            html.AppendLine($"                        <div class='section-header'>📋 Namespace: {ns}</div>");
+                            
+                            // Show types for this specific namespace
+                            if (package.TypesByNamespace.ContainsKey(ns) && package.TypesByNamespace[ns].Any())
                             {
-                                html.AppendLine($"                            <li class='type-item'>{type}</li>");
+                                html.AppendLine("                        <ul class='type-list'>");
+                                foreach (var type in package.TypesByNamespace[ns].OrderBy(t => t))
+                                {
+                                    html.AppendLine($"                            <li class='type-item'>{type}</li>");
+                                }
+                                html.AppendLine("                        </ul>");
                             }
-                            html.AppendLine("                        </ul>");
+                            else
+                            {
+                                html.AppendLine("                        <p style='margin-left: 15px; color: #95a5a6; font-size: 13px;'>No specific types detected (namespace imported but types not explicitly identified)</p>");
+                            }
                         }
 
                         if (package.Files.Any())
@@ -647,12 +807,14 @@ namespace DotNetCrawler
             public string PackageName { get; set; }
             public string Version { get; set; }
             public HashSet<string> UsedNamespaces { get; set; }
-            public HashSet<string> UsedTypes { get; set; }
+            public Dictionary<string, HashSet<string>> TypesByNamespace { get; set; } // Namespace -> Types
+            public HashSet<string> UsedTypes { get; set; } // All types combined (for backward compatibility)
             public HashSet<string> Files { get; set; }
 
             public PackageUsageDetail()
             {
                 UsedNamespaces = new HashSet<string>();
+                TypesByNamespace = new Dictionary<string, HashSet<string>>();
                 UsedTypes = new HashSet<string>();
                 Files = new HashSet<string>();
             }
