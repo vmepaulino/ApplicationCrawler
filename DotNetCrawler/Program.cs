@@ -300,6 +300,7 @@ namespace DotNetCrawler
                     }
                     catch
                     {
+                        Console.WriteLine($"   DLL {dllName} not loaded ! ");
                         // Skip DLLs that can't be loaded
                     }
                 }
@@ -645,6 +646,24 @@ namespace DotNetCrawler
             html.AppendLine("        .summary-item { background: white; padding: 15px; border-radius: 4px; text-align: center; }");
             html.AppendLine("        .summary-number { font-size: 32px; font-weight: bold; color: #3498db; }");
             html.AppendLine("        .summary-label { color: #7f8c8d; font-size: 14px; margin-top: 5px; }");
+            html.AppendLine("        .type-index-section { margin-top: 50px; padding-top: 30px; border-top: 3px solid #e0e0e0; }");
+            html.AppendLine("        .type-index-title { color: #2c3e50; font-size: 28px; margin-bottom: 10px; }");
+            html.AppendLine("        .type-index-description { color: #7f8c8d; margin-bottom: 20px; }");
+            html.AppendLine("        .type-index-search { margin-bottom: 20px; }");
+            html.AppendLine("        .type-index-search input { width: 100%; padding: 12px 20px; font-size: 16px; border: 2px solid #e0e0e0; border-radius: 6px; outline: none; }");
+            html.AppendLine("        .type-index-search input:focus { border-color: #3498db; }");
+            html.AppendLine("        .type-index-list { }");
+            html.AppendLine("        .type-index-item { background: white; margin-bottom: 10px; border-radius: 6px; border: 1px solid #e0e0e0; overflow: hidden; }");
+            html.AppendLine("        .type-index-header { padding: 15px 20px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; background: linear-gradient(to right, #f8f9fa, white); }");
+            html.AppendLine("        .type-index-header:hover { background: linear-gradient(to right, #e9ecef, #f8f9fa); }");
+            html.AppendLine("        .type-index-name { font-family: 'Courier New', monospace; font-size: 16px; font-weight: 600; color: #1976d2; }");
+            html.AppendLine("        .type-index-summary { display: flex; gap: 15px; align-items: center; }");
+            html.AppendLine("        .type-badge { background: #e3f2fd; padding: 4px 12px; border-radius: 12px; font-size: 12px; color: #1976d2; font-weight: 500; }");
+            html.AppendLine("        .type-index-detail { display: none; padding: 20px; background: #fafafa; border-top: 1px solid #e0e0e0; }");
+            html.AppendLine("        .type-usage-package { background: #fff3cd; padding: 12px; border-radius: 4px; margin-bottom: 15px; font-size: 14px; color: #856404; }");
+            html.AppendLine("        .type-usage-project { margin-bottom: 15px; padding: 12px; background: white; border-radius: 4px; border-left: 3px solid #3498db; }");
+            html.AppendLine("        .project-label { font-weight: 600; color: #2c3e50; display: block; margin-bottom: 8px; }");
+            html.AppendLine("        .type-usage-files { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }");
             html.AppendLine("    </style>");
             html.AppendLine("</head>");
             html.AppendLine("<body>");
@@ -756,6 +775,77 @@ namespace DotNetCrawler
                 html.AppendLine("        </div>");
             }
 
+            // Type Index Section - All types across solution
+            var typeIndex = BuildTypeIndex(results);
+            
+            if (typeIndex.Any())
+            {
+                html.AppendLine("        <div class='type-index-section'>");
+                html.AppendLine("            <h2 class='type-index-title'>🔷 Type Index - All Types Used Across Solution</h2>");
+                html.AppendLine("            <p class='type-index-description'>This section shows all unique types and where they are used throughout the solution.</p>");
+                
+                html.AppendLine("            <div class='type-index-search'>");
+                html.AppendLine("                <input type='text' id='typeSearch' placeholder='🔍 Search for a type...' onkeyup='filterTypes()' />");
+                html.AppendLine("            </div>");
+
+                html.AppendLine("            <div class='type-index-list'>");
+                
+                foreach (var typeEntry in typeIndex.OrderBy(t => t.Key))
+                {
+                    var typeName = typeEntry.Key;
+                    var usages = typeEntry.Value;
+                    var typeId = $"type-{typeName.Replace("<", "-").Replace(">", "-")}";
+                    
+                    var typeProjectCount = usages.Select(u => u.ProjectName).Distinct().Count();
+                    var typeFileCount = usages.SelectMany(u => u.Files).Distinct().Count();
+
+                    html.AppendLine($"                <div class='type-index-item' data-typename='{typeName.ToLower()}'>");
+                    html.AppendLine($"                    <div class='type-index-header' onclick='toggleTypeDetail(\"{typeId}\")'>");
+                    html.AppendLine($"                        <div class='type-index-name'>{typeName}</div>");
+                    html.AppendLine($"                        <div class='type-index-summary'>");
+                    html.AppendLine($"                            <span class='type-badge'>📦 {usages.Select(u => u.PackageName).Distinct().Count()} package(s)</span>");
+                    html.AppendLine($"                            <span class='type-badge'>📁 {typeProjectCount} project(s)</span>");
+                    html.AppendLine($"                            <span class='type-badge'>📄 {typeFileCount} file(s)</span>");
+                    html.AppendLine($"                            <span class='toggle-icon' id='icon-{typeId}'>▶</span>");
+                    html.AppendLine($"                        </div>");
+                    html.AppendLine("                    </div>");
+                    html.AppendLine($"                    <div class='type-index-detail' id='detail-{typeId}'>");
+
+                    // Group by package
+                    var packageGroups = usages.GroupBy(u => u.PackageName);
+                    foreach (var packageGroup in packageGroups.OrderBy(g => g.Key))
+                    {
+                        html.AppendLine($"                        <div class='type-usage-package'>");
+                        html.AppendLine($"                            <strong>Package:</strong> {packageGroup.Key}");
+                        html.AppendLine($"                            <br/><strong>Namespace:</strong> {packageGroup.First().Namespace}");
+                        html.AppendLine("                        </div>");
+
+                        // List projects using this type from this package
+                        var projectGroups = packageGroup.GroupBy(u => u.ProjectName);
+                        foreach (var projectGroup in projectGroups.OrderBy(g => g.Key))
+                        {
+                            html.AppendLine($"                        <div class='type-usage-project'>");
+                            html.AppendLine($"                            <span class='project-label'>📁 {projectGroup.Key}</span>");
+                            html.AppendLine("                            <div class='type-usage-files'>");
+                            
+                            var allFiles = projectGroup.SelectMany(u => u.Files).Distinct().OrderBy(f => f);
+                            foreach (var file in allFiles)
+                            {
+                                html.AppendLine($"                                <span class='file-item'>{file}</span>");
+                            }
+                            html.AppendLine("                            </div>");
+                            html.AppendLine("                        </div>");
+                        }
+                    }
+
+                    html.AppendLine("                    </div>");
+                    html.AppendLine("                </div>");
+                }
+
+                html.AppendLine("            </div>");
+                html.AppendLine("        </div>");
+            }
+
             html.AppendLine("    </div>");
             html.AppendLine("    <script>");
             html.AppendLine("        function toggleProject(projectName) {");
@@ -775,11 +865,70 @@ namespace DotNetCrawler
             html.AppendLine("            content.classList.toggle('show');");
             html.AppendLine("            icon.classList.toggle('open');");
             html.AppendLine("        }");
+            html.AppendLine("        function toggleTypeDetail(typeId) {");
+            html.AppendLine("            var detail = document.getElementById('detail-' + typeId);");
+            html.AppendLine("            var icon = document.getElementById('icon-' + typeId);");
+            html.AppendLine("            if (detail.style.display === 'none' || !detail.style.display) {");
+            html.AppendLine("                detail.style.display = 'block';");
+            html.AppendLine("                icon.classList.add('open');");
+            html.AppendLine("            } else {");
+            html.AppendLine("                detail.style.display = 'none';");
+            html.AppendLine("                icon.classList.remove('open');");
+            html.AppendLine("            }");
+            html.AppendLine("        }");
+            html.AppendLine("        function filterTypes() {");
+            html.AppendLine("            var input = document.getElementById('typeSearch').value.toLowerCase();");
+            html.AppendLine("            var items = document.querySelectorAll('.type-index-item');");
+            html.AppendLine("            items.forEach(function(item) {");
+            html.AppendLine("                var typeName = item.getAttribute('data-typename');");
+            html.AppendLine("                if (typeName.includes(input)) {");
+            html.AppendLine("                    item.style.display = '';");
+            html.AppendLine("                } else {");
+            html.AppendLine("                    item.style.display = 'none';");
+            html.AppendLine("                }");
+            html.AppendLine("            });");
+            html.AppendLine("        }");
             html.AppendLine("    </script>");
             html.AppendLine("</body>");
             html.AppendLine("</html>");
 
             File.WriteAllText(outputFile, html.ToString());
+        }
+
+        static Dictionary<string, List<TypeUsageInfo>> BuildTypeIndex(List<ProjectAnalysisResult> results)
+        {
+            var typeIndex = new Dictionary<string, List<TypeUsageInfo>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var project in results)
+            {
+                foreach (var package in project.PackageUsages)
+                {
+                    foreach (var nsEntry in package.TypesByNamespace)
+                    {
+                        var ns = nsEntry.Key;
+                        var types = nsEntry.Value;
+
+                        foreach (var type in types)
+                        {
+                            if (!typeIndex.ContainsKey(type))
+                            {
+                                typeIndex[type] = new List<TypeUsageInfo>();
+                            }
+
+                            typeIndex[type].Add(new TypeUsageInfo
+                            {
+                                TypeName = type,
+                                Namespace = ns,
+                                PackageName = package.PackageName,
+                                ProjectName = project.ProjectName,
+                                Files = package.Files.ToList()
+                            });
+                        }
+                    }
+                }
+            }
+
+            return typeIndex;
         }
 
         static ParsedArguments ParseArguments(string[] args)
@@ -903,6 +1052,15 @@ namespace DotNetCrawler
                 UsedTypes = new HashSet<string>();
                 Files = new HashSet<string>();
             }
+        }
+
+        class TypeUsageInfo
+        {
+            public string TypeName { get; set; }
+            public string Namespace { get; set; }
+            public string PackageName { get; set; }
+            public string ProjectName { get; set; }
+            public List<string> Files { get; set; }
         }
     }
 }
