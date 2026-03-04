@@ -6,6 +6,8 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Xml.Linq;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace DotNetCrawler
@@ -23,7 +25,7 @@ namespace DotNetCrawler
                     return;
                 }
 
-                MainAsync(parsedArgs.SolutionPath, parsedArgs.DependencyPatterns, parsedArgs.OutputFile).GetAwaiter().GetResult();
+                MainAsync(parsedArgs.SolutionPath, parsedArgs.DependencyPatterns, parsedArgs.OutputFile, parsedArgs.BinPaths).GetAwaiter().GetResult();
             }
             catch (Exception ex)
             {
@@ -34,7 +36,7 @@ namespace DotNetCrawler
             }
         }
 
-        static async Task MainAsync(string solutionPath, string[] dependencyPatterns, string outputFile = null)
+        static async Task MainAsync(string solutionPath, string[] dependencyPatterns, string outputFile = null, string[] binPaths = null)
         {
             if (!File.Exists(solutionPath))
             {
@@ -116,7 +118,11 @@ namespace DotNetCrawler
                 }
 
                 Console.WriteLine("\n🔄 Next Step: Analyzing actual code usage...");
-                var analysisResults = await AnalyzeCodeUsageByProjectAsync(projectInfos, matchedPackages.Keys.ToArray());
+                
+                // Load DLL references for semantic analysis
+                var metadataReferences = LoadMetadataReferences(solutionDir, projectInfos, binPaths);
+                
+                var analysisResults = await AnalyzeCodeUsageByProjectAsync(projectInfos, matchedPackages.Keys.ToArray(), metadataReferences);
                 
                 // Display console summary
                 DisplayConsoleSummary(analysisResults);
@@ -216,9 +222,96 @@ namespace DotNetCrawler
             return new Regex(regexPattern, RegexOptions.IgnoreCase);
         }
 
-        static async Task<List<ProjectAnalysisResult>> AnalyzeCodeUsageByProjectAsync(List<ProjectInfo> projects, string[] packageNames)
+        static List<MetadataReference> LoadMetadataReferences(string solutionDir, List<ProjectInfo> projects, string[] binPaths)
         {
-            Console.WriteLine("\n🔬 Analyzing code usage (this may take a moment)...");
+            Console.WriteLine("\n🔧 Loading assembly references for semantic analysis...");
+            
+            var references = new List<MetadataReference>();
+            var loadedDlls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // Add framework references
+            var frameworkPath = System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory();
+            var frameworkDlls = new[] { "mscorlib.dll", "System.dll", "System.Core.dll", "System.Xml.dll", "System.Linq.dll" };
+            
+            foreach (var dll in frameworkDlls)
+            {
+                var dllPath = Path.Combine(frameworkPath, dll);
+                if (File.Exists(dllPath))
+                {
+                    try
+                    {
+                        references.Add(MetadataReference.CreateFromFile(dllPath));
+                        loadedDlls.Add(dll);
+                    }
+                    catch { /* Skip if can't load */ }
+                }
+            }
+
+            var searchPaths = new List<string>();
+
+            // Use provided bin paths
+            if (binPaths != null && binPaths.Any())
+            {
+                searchPaths.AddRange(binPaths);
+            }
+            else
+            {
+                // Auto-detect bin folders
+                foreach (var project in projects)
+                {
+                    var projectDir = Path.GetDirectoryName(project.Path);
+                    var binDebug = Path.Combine(projectDir, "bin", "Debug");
+                    var binRelease = Path.Combine(projectDir, "bin", "Release");
+
+                    if (Directory.Exists(binRelease))
+                        searchPaths.Add(binRelease);
+                    else if (Directory.Exists(binDebug))
+                        searchPaths.Add(binDebug);
+                }
+
+                // Also check for packages folder
+                var packagesFolder = Path.Combine(solutionDir, "packages");
+                if (Directory.Exists(packagesFolder))
+                {
+                    var packageDllFolders = Directory.GetDirectories(packagesFolder, "*", SearchOption.AllDirectories)
+                        .Where(d => d.Contains("\\lib\\") && !d.Contains("\\build\\"));
+                    searchPaths.AddRange(packageDllFolders);
+                }
+            }
+
+            // Load DLLs from all search paths
+            foreach (var searchPath in searchPaths.Distinct())
+            {
+                if (!Directory.Exists(searchPath))
+                    continue;
+
+                var dlls = Directory.GetFiles(searchPath, "*.dll", SearchOption.TopDirectoryOnly);
+                
+                foreach (var dll in dlls)
+                {
+                    var dllName = Path.GetFileName(dll);
+                    if (loadedDlls.Contains(dllName))
+                        continue;
+
+                    try
+                    {
+                        references.Add(MetadataReference.CreateFromFile(dll));
+                        loadedDlls.Add(dllName);
+                    }
+                    catch
+                    {
+                        // Skip DLLs that can't be loaded
+                    }
+                }
+            }
+
+            Console.WriteLine($"   ✅ Loaded {references.Count} assembly references");
+            return references;
+        }
+
+        static async Task<List<ProjectAnalysisResult>> AnalyzeCodeUsageByProjectAsync(List<ProjectInfo> projects, string[] packageNames, List<MetadataReference> metadataReferences)
+        {
+            Console.WriteLine("\n🔬 Analyzing code usage with semantic analysis...");
 
             var results = new List<ProjectAnalysisResult>();
 
@@ -232,7 +325,8 @@ namespace DotNetCrawler
 
                 var projectDir = Path.GetDirectoryName(projectInfo.Path);
                 var csFiles = Directory.GetFiles(projectDir, "*.cs", SearchOption.AllDirectories)
-                    .Where(f => !f.Contains("\\obj\\") && !f.Contains("\\bin\\"));
+                    .Where(f => !f.Contains("\\obj\\") && !f.Contains("\\bin\\"))
+                    .ToList();
 
                 // Get matched packages for this project
                 var matchedPackagesForProject = projectInfo.Packages
@@ -250,17 +344,41 @@ namespace DotNetCrawler
                     projectResult.PackageUsages.Add(packageUsage);
                 }
 
+                // Create a compilation for this project's files
+                var syntaxTrees = new List<SyntaxTree>();
+                var fileContents = new Dictionary<string, string>();
+
                 foreach (var csFile in csFiles)
                 {
                     try
                     {
                         var code = File.ReadAllText(csFile);
-                        var tree = Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(code);
+                        fileContents[csFile] = code;
+                        var tree = CSharpSyntaxTree.ParseText(code, path: csFile);
+                        syntaxTrees.Add(tree);
+                    }
+                    catch { /* Skip files that can't be read */ }
+                }
+
+                // Create compilation with all references
+                var compilation = CSharpCompilation.Create(
+                    projectInfo.Name,
+                    syntaxTrees: syntaxTrees,
+                    references: metadataReferences,
+                    options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
+                );
+
+                // Analyze each file with semantic model
+                foreach (var tree in syntaxTrees)
+                {
+                    try
+                    {
+                        var semanticModel = compilation.GetSemanticModel(tree);
                         var root = await tree.GetRootAsync();
 
                         // Look for using directives
                         var usingDirectives = root.DescendantNodes()
-                            .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax>()
+                            .OfType<UsingDirectiveSyntax>()
                             .Select(u => u.Name.ToString())
                             .ToHashSet();
 
@@ -284,17 +402,16 @@ namespace DotNetCrawler
                                     }
                                 }
 
-                                // Find types that are likely from the package's namespaces
-                                // Look for: base types, object creation, type references with namespace prefix
-                                ExtractTypesFromNamespaces(root, packageNamespacesInFile, packageUsage);
+                                // Extract types using semantic model
+                                ExtractTypesWithSemanticModel(root, semanticModel, packageNamespacesInFile, packageUsage);
 
-                                packageUsage.Files.Add(Path.GetFileName(csFile));
+                                packageUsage.Files.Add(Path.GetFileName(tree.FilePath));
                             }
                         }
                     }
                     catch (Exception ex)
                     {
-                        // Ignore files that can't be parsed
+                        // Ignore files that can't be analyzed
                     }
                 }
 
@@ -302,214 +419,6 @@ namespace DotNetCrawler
             }
 
             return results;
-        }
-
-        static HashSet<string> GetCommonSystemTypes()
-        {
-            return new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                // System types
-                "String", "Int32", "Int64", "Boolean", "DateTime", "TimeSpan", "Guid", "Decimal", "Double", "Float",
-                "Byte", "Char", "Object", "Void", "Exception", "Type", "Enum", "ValueType",
-                
-                // Collections
-                "List", "Dictionary", "HashSet", "IEnumerable", "ICollection", "IList", "IDictionary",
-                "Array", "ArrayList", "Queue", "Stack", "LinkedList", "SortedList", "SortedDictionary",
-                
-                // Generic types
-                "Tuple", "KeyValuePair", "Nullable", "Lazy",
-                
-                // LINQ method names (these get picked up as "types" incorrectly)
-                "Where", "Select", "SelectMany", "FirstOrDefault", "First", "LastOrDefault", "Last",
-                "Any", "All", "Count", "Sum", "Average", "Min", "Max", "OrderBy", "OrderByDescending",
-                "ThenBy", "ThenByDescending", "GroupBy", "Join", "Distinct", "Union", "Intersect",
-                "Except", "Take", "Skip", "ToList", "ToArray", "ToDictionary", "ToHashSet",
-                "Aggregate", "Contains", "SingleOrDefault", "Single",
-                
-                // Threading
-                "Task", "Thread", "CancellationToken", "CancellationTokenSource", "Semaphore", "Mutex",
-                
-                // IO
-                "Stream", "File", "Directory", "Path", "FileInfo", "DirectoryInfo", "StreamReader", "StreamWriter",
-                
-                // Common interfaces
-                "IDisposable", "IComparable", "IEquatable", "ICloneable", "IConvertible", "IFormatProvider",
-                
-                // Action/Func
-                "Action", "Func", "Predicate", "Delegate", "EventHandler",
-                
-                // Reflection
-                "MethodInfo", "PropertyInfo", "FieldInfo", "ConstructorInfo", "MemberInfo", "Assembly",
-                
-                // Text
-                "StringBuilder", "Encoding", "Regex", "Match",
-                
-                // XML/JSON
-                "XDocument", "XElement", "XAttribute", "JsonSerializer", "JsonConvert",
-                
-                // Common Microsoft types
-                "DbContext", "DbSet", "ILogger", "IConfiguration", "IServiceProvider", "IHostBuilder",
-                "HttpClient", "HttpRequest", "HttpResponse", "Controller", "ApiController",
-                
-                // Other common
-                "Console", "Math", "Convert", "Random", "Environment", "GC", "Uri", "Version",
-                "Attribute", "Obsolete", "Serializable",
-                
-                // Namespace-like identifiers that get picked up
-                "System", "Microsoft", "Collections", "Generic", "Linq", "Threading", "Tasks",
-                "Text", "IO", "Net", "Http", "Data", "Entity", "Core", "Web", "Mvc", "Api"
-            };
-        }
-
-        static bool LooksLikeMethod(string identifier)
-        {
-            // Check if it contains parentheses (method call indicators)
-            if (identifier.Contains("(") || identifier.Contains(")"))
-                return true;
-            
-            // Check if it contains common parameter indicators
-            if (identifier.Contains(":") || identifier.Contains(","))
-                return true;
-            
-            // Common method verb prefixes
-            var methodVerbs = new[] { "Get", "Set", "Add", "Remove", "Delete", "Create", "Update", 
-                                     "Find", "Load", "Save", "Insert", "Execute", "Run", "Start",
-                                     "Stop", "Parse", "Calculate", "Compute", "Process", "Handle",
-                                     "Validate", "Check", "Is", "Has", "Can", "Should", "Build",
-                                     "Generate", "Retrieve", "Fetch", "Query", "Search", "Filter" };
-            
-            // If identifier is very short (1-2 chars) and starts with verb, likely a method
-            foreach (var verb in methodVerbs)
-            {
-                if (identifier == verb || 
-                    (identifier.StartsWith(verb) && identifier.Length > verb.Length && 
-                     char.IsUpper(identifier[verb.Length])))
-                {
-                    // Additional check: if it ends with common suffixes that indicate methods
-                    var methodSuffixes = new[] { "Async", "All", "ById", "ByName", "List", "Collection",
-                                                 "Result", "Results", "Data", "Info" };
-                    
-                    foreach (var suffix in methodSuffixes)
-                    {
-                        if (identifier.EndsWith(suffix))
-                            return true;
-                    }
-                    
-                    // If it's just the verb or verb + one more word, more likely to be a method
-                    // unless it's something like "GetType" which is actually a method but commonly used
-                    if (identifier.Length <= verb.Length + 10) // Short names are more likely methods
-                    {
-                        return true;
-                    }
-                }
-            }
-            
-            return false;
-        }
-
-        static void FilterCommonTypes(PackageUsageDetail packageUsage)
-        {
-            var commonTypes = GetCommonSystemTypes();
-            
-            // Filter UsedTypes - remove system types and things that look like methods
-            packageUsage.UsedTypes.RemoveWhere(t => commonTypes.Contains(t) || LooksLikeMethod(t));
-            
-            // Filter TypesByNamespace
-            foreach (var ns in packageUsage.TypesByNamespace.Keys.ToList())
-            {
-                packageUsage.TypesByNamespace[ns].RemoveWhere(t => commonTypes.Contains(t) || LooksLikeMethod(t));
-            }
-        }
-
-        static void ExtractTypesFromNamespaces(Microsoft.CodeAnalysis.SyntaxNode root, List<string> packageNamespaces, PackageUsageDetail packageUsage)
-        {
-            // Look for qualified names (e.g., Praxsys.SDS.Jobs.JobBase)
-            var qualifiedNames = root.DescendantNodes()
-                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.QualifiedNameSyntax>();
-
-            foreach (var qualifiedName in qualifiedNames)
-            {
-                var fullName = qualifiedName.ToString();
-                foreach (var ns in packageNamespaces)
-                {
-                    if (fullName.StartsWith(ns + ".", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var typeName = fullName.Substring(ns.Length + 1).Split('.')[0];
-                        if (!string.IsNullOrWhiteSpace(typeName))
-                        {
-                            packageUsage.TypesByNamespace[ns].Add(typeName);
-                            packageUsage.UsedTypes.Add(typeName);
-                        }
-                    }
-                }
-            }
-
-            // Look for member access expressions that might indicate types from the namespace
-            // This helps catch static method calls like SomeType.Method()
-            var memberAccess = root.DescendantNodes()
-                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax>();
-
-            foreach (var access in memberAccess)
-            {
-                var leftSide = access.Expression.ToString();
-                
-                // If the left side is a simple identifier starting with uppercase, it might be a type
-                if (!leftSide.Contains(".") && !string.IsNullOrWhiteSpace(leftSide) && 
-                    leftSide.Length > 0 && char.IsUpper(leftSide[0]))
-                {
-                    // Check if this could be from one of our namespaces (heuristic)
-                    // We'll add it to the first matching namespace that we've imported
-                    if (packageNamespaces.Any())
-                    {
-                        var firstNs = packageNamespaces[0];
-                        packageUsage.TypesByNamespace[firstNs].Add(leftSide);
-                        packageUsage.UsedTypes.Add(leftSide);
-                    }
-                }
-            }
-
-            // Look for object creation expressions (new SomeType())
-            var objectCreations = root.DescendantNodes()
-                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.ObjectCreationExpressionSyntax>();
-
-            foreach (var creation in objectCreations)
-            {
-                var typeName = creation.Type.ToString().Split('<')[0].Split('.').Last();
-                if (!string.IsNullOrWhiteSpace(typeName) && char.IsUpper(typeName[0]))
-                {
-                    // Add to the first matching namespace (best guess)
-                    if (packageNamespaces.Any())
-                    {
-                        var firstNs = packageNamespaces[0];
-                        packageUsage.TypesByNamespace[firstNs].Add(typeName);
-                        packageUsage.UsedTypes.Add(typeName);
-                    }
-                }
-            }
-
-            // Look for base types in class declarations
-            var classDeclarations = root.DescendantNodes()
-                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.ClassDeclarationSyntax>();
-
-            foreach (var classDecl in classDeclarations)
-            {
-                if (classDecl.BaseList != null)
-                {
-                    foreach (var baseType in classDecl.BaseList.Types)
-                    {
-                        var typeName = baseType.Type.ToString().Split('<')[0].Split('.').Last();
-                        if (!string.IsNullOrWhiteSpace(typeName) && char.IsUpper(typeName[0]))
-                        {
-                            if (packageNamespaces.Any())
-                            {
-                                var firstNs = packageNamespaces[0];
-                                packageUsage.TypesByNamespace[firstNs].Add(typeName);
-                                packageUsage.UsedTypes.Add(typeName);
-                            }
-                        }
-                    }
-                }
-            }
         }
 
         static void DisplayConsoleSummary(List<ProjectAnalysisResult> results)
@@ -527,9 +436,6 @@ namespace DotNetCrawler
 
                 foreach (var packageUsage in projectResult.PackageUsages)
                 {
-                    // Filter out common system types before displaying
-                    FilterCommonTypes(packageUsage);
-                    
                     Console.WriteLine($"\n  📦 {packageUsage.PackageName} (v{packageUsage.Version})");
                     Console.WriteLine($"     Namespaces: {packageUsage.UsedNamespaces.Count}");
                     Console.WriteLine($"     Types: {packageUsage.UsedTypes.Count}");
@@ -565,6 +471,128 @@ namespace DotNetCrawler
                         Console.ForegroundColor = ConsoleColor.Yellow;
                         Console.WriteLine($"     ⚠️  Package referenced but not used in code!");
                         Console.ResetColor();
+                    }
+                }
+            }
+        }
+
+        static void ExtractTypesWithSemanticModel(SyntaxNode root, SemanticModel semanticModel, List<string> packageNamespaces, PackageUsageDetail packageUsage)
+        {
+            // Get all identifier names in the syntax tree
+            var identifiers = root.DescendantNodes()
+                .OfType<IdentifierNameSyntax>();
+
+            foreach (var identifier in identifiers)
+            {
+                try
+                {
+                    var symbolInfo = semanticModel.GetSymbolInfo(identifier);
+                    var symbol = symbolInfo.Symbol;
+
+                    if (symbol == null)
+                        continue;
+
+                    // Only process type symbols (not methods, properties, etc.)
+                    if (symbol is INamedTypeSymbol typeSymbol)
+                    {
+                        var containingNamespace = typeSymbol.ContainingNamespace?.ToDisplayString();
+                        
+                        if (string.IsNullOrEmpty(containingNamespace))
+                            continue;
+
+                        // Check if this type belongs to one of our package namespaces
+                        foreach (var ns in packageNamespaces)
+                        {
+                            if (containingNamespace.StartsWith(ns, StringComparison.OrdinalIgnoreCase))
+                            {
+                                var typeName = typeSymbol.Name;
+                                packageUsage.TypesByNamespace[ns].Add(typeName);
+                                packageUsage.UsedTypes.Add(typeName);
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // Skip symbols that can't be resolved
+                }
+            }
+
+            // Also check generic names
+            var genericNames = root.DescendantNodes()
+                .OfType<GenericNameSyntax>();
+
+            foreach (var genericName in genericNames)
+            {
+                try
+                {
+                    var symbolInfo = semanticModel.GetSymbolInfo(genericName);
+                    var symbol = symbolInfo.Symbol;
+
+                    if (symbol is INamedTypeSymbol typeSymbol)
+                    {
+                        var containingNamespace = typeSymbol.ContainingNamespace?.ToDisplayString();
+                        
+                        if (string.IsNullOrEmpty(containingNamespace))
+                            continue;
+
+                        foreach (var ns in packageNamespaces)
+                        {
+                            if (containingNamespace.StartsWith(ns, StringComparison.OrdinalIgnoreCase))
+                            {
+                                var typeName = typeSymbol.Name;
+                                packageUsage.TypesByNamespace[ns].Add(typeName);
+                                packageUsage.UsedTypes.Add(typeName);
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // Skip symbols that can't be resolved
+                }
+            }
+
+            // Check base types in class/interface declarations
+            var typeDeclarations = root.DescendantNodes()
+                .OfType<BaseTypeDeclarationSyntax>();
+
+            foreach (var typeDecl in typeDeclarations)
+            {
+                if (typeDecl.BaseList != null)
+                {
+                    foreach (var baseType in typeDecl.BaseList.Types)
+                    {
+                        try
+                        {
+                            var typeInfo = semanticModel.GetTypeInfo(baseType.Type);
+                            var symbol = typeInfo.Type as INamedTypeSymbol;
+
+                            if (symbol != null)
+                            {
+                                var containingNamespace = symbol.ContainingNamespace?.ToDisplayString();
+                                
+                                if (string.IsNullOrEmpty(containingNamespace))
+                                    continue;
+
+                                foreach (var ns in packageNamespaces)
+                                {
+                                    if (containingNamespace.StartsWith(ns, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        var typeName = symbol.Name;
+                                        packageUsage.TypesByNamespace[ns].Add(typeName);
+                                        packageUsage.UsedTypes.Add(typeName);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // Skip types that can't be resolved
+                        }
                     }
                 }
             }
@@ -663,9 +691,6 @@ namespace DotNetCrawler
 
                 foreach (var package in project.PackageUsages.OrderBy(p => p.PackageName))
                 {
-                    // Filter out common system types before rendering
-                    FilterCommonTypes(package);
-                    
                     var isUnused = !package.UsedNamespaces.Any();
                     var packageId = $"{project.ProjectName}-{package.PackageName}".Replace(".", "-");
 
@@ -762,6 +787,7 @@ namespace DotNetCrawler
             string solutionPath = null;
             string outputFile = null;
             var dependencies = new List<string>();
+            var binPaths = new List<string>();
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -779,6 +805,15 @@ namespace DotNetCrawler
                     {
                         outputFile = args[i + 1];
                         i++;
+                    }
+                }
+                else if (args[i] == "--bin-paths" || args[i] == "-b")
+                {
+                    // Collect all following arguments until next flag
+                    for (int j = i + 1; j < args.Length && !args[j].StartsWith("-"); j++)
+                    {
+                        binPaths.Add(args[j]);
+                        i = j;
                     }
                 }
                 else if (args[i] == "--dependencies" || args[i] == "-d")
@@ -801,7 +836,8 @@ namespace DotNetCrawler
             {
                 SolutionPath = solutionPath,
                 DependencyPatterns = dependencies.ToArray(),
-                OutputFile = outputFile
+                OutputFile = outputFile,
+                BinPaths = binPaths.Any() ? binPaths.ToArray() : null
             };
         }
 
@@ -810,16 +846,18 @@ namespace DotNetCrawler
             Console.WriteLine("Application Crawler - Analyzes NuGet package usage in .NET solutions");
             Console.WriteLine();
             Console.WriteLine("Usage:");
-            Console.WriteLine("  DotNetCrawler.exe --solution <path> --dependencies <pattern1> [pattern2] ... [--output <file>]");
+            Console.WriteLine("  DotNetCrawler.exe --solution <path> --dependencies <pattern1> [pattern2] ... [--output <file>] [--bin-paths <path1> <path2> ...]");
             Console.WriteLine();
             Console.WriteLine("Options:");
             Console.WriteLine("  -s, --solution <path>          Path to the solution file (.sln)");
             Console.WriteLine("  -d, --dependencies <patterns>  NuGet package name patterns (supports wildcards)");
             Console.WriteLine("  -o, --output <file>           Path to output HTML report (optional)");
+            Console.WriteLine("  -b, --bin-paths <paths>       Paths to bin folders with compiled DLLs for accurate analysis (optional, auto-detected if not specified)");
             Console.WriteLine();
             Console.WriteLine("Examples:");
             Console.WriteLine("  DotNetCrawler.exe -s MySolution.sln -d \"Newtonsoft.*\" \"System.Net.Http\"");
             Console.WriteLine("  DotNetCrawler.exe --solution \"C:\\Projects\\App.sln\" --dependencies \"MyLib.*\" --output report.html");
+            Console.WriteLine("  DotNetCrawler.exe -s MySolution.sln -d \"MyLib.*\" -b \"C:\\Projects\\bin\\Debug\" \"C:\\Projects\\bin\\Release\"");
         }
 
         class ParsedArguments
@@ -827,6 +865,7 @@ namespace DotNetCrawler
             public string SolutionPath { get; set; }
             public string[] DependencyPatterns { get; set; }
             public string OutputFile { get; set; }
+            public string[] BinPaths { get; set; }
         }
 
         class ProjectInfo
