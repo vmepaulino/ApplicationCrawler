@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -44,24 +45,36 @@ namespace DotNetCrawler
                 return;
             }
 
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+            Console.WriteLine(new string('=', 60));
             Console.WriteLine($"🔍 Analyzing solution: {Path.GetFileName(solutionPath)}");
+            Console.WriteLine($"   Path: {Path.GetFullPath(solutionPath)}");
             Console.WriteLine($"📦 Dependency patterns: {string.Join(", ", dependencyPatterns)}");
+            if (binPaths != null && binPaths.Length > 0)
+                Console.WriteLine($"📂 Custom bin paths: {string.Join(", ", binPaths)}");
+            Console.WriteLine(new string('=', 60));
             Console.WriteLine();
 
-            Console.WriteLine("⏳ Loading solution...");
+            Console.WriteLine("[Step 1/5] ⏳ Parsing solution file...");
             
             var solutionDir = Path.GetDirectoryName(solutionPath);
             var projectPaths = ParseSolutionFile(solutionPath);
             
-            Console.WriteLine($"✅ Found {projectPaths.Count} projects");
+            Console.WriteLine($"[Step 1/5] ✅ Found {projectPaths.Count} project(s) in solution ({stopwatch.ElapsedMilliseconds}ms)");
+            Console.WriteLine();
+
+            Console.WriteLine("[Step 2/5] 📦 Scanning projects for matching NuGet packages...");
             Console.WriteLine();
 
             var patterns = dependencyPatterns.Select(ConvertWildcardToRegex).ToArray();
             var matchedPackages = new Dictionary<string, HashSet<string>>(); // Package -> Projects
             var projectInfos = new List<ProjectInfo>();
+            var projectIndex = 0;
 
             foreach (var projectPath in projectPaths)
             {
+                projectIndex++;
                 var fullProjectPath = Path.Combine(solutionDir, projectPath);
                 if (!File.Exists(fullProjectPath))
                 {
@@ -70,9 +83,10 @@ namespace DotNetCrawler
                 }
 
                 var projectName = Path.GetFileNameWithoutExtension(projectPath);
-                Console.WriteLine($"📁 Project: {projectName}");
+                Console.WriteLine($"   [{projectIndex}/{projectPaths.Count}] 📁 {projectName}");
 
                 var packages = GetNuGetPackagesFromProjectFile(fullProjectPath);
+                Console.WriteLine($"          {packages.Count} package reference(s) found");
 
                 foreach (var package in packages)
                 {
@@ -104,35 +118,65 @@ namespace DotNetCrawler
                 Console.WriteLine();
             }
 
+            Console.WriteLine();
             Console.WriteLine(new string('=', 60));
-            Console.WriteLine("📊 SUMMARY");
+            Console.WriteLine("📊 PACKAGE SCAN SUMMARY");
             Console.WriteLine(new string('=', 60));
+            Console.WriteLine($"   Scanned {projectPaths.Count} project(s) in {stopwatch.ElapsedMilliseconds}ms");
 
             if (matchedPackages.Any())
             {
-                Console.WriteLine($"\nFound {matchedPackages.Count} matching packages:");
+                Console.WriteLine($"   Found {matchedPackages.Count} matching package(s):");
                 foreach (var kvp in matchedPackages.OrderBy(x => x.Key))
                 {
-                    Console.WriteLine($"\n  📦 {kvp.Key}");
-                    Console.WriteLine($"     Used in {kvp.Value.Count} project(s): {string.Join(", ", kvp.Value)}");
+                    Console.WriteLine($"     📦 {kvp.Key} → {kvp.Value.Count} project(s): {string.Join(", ", kvp.Value)}");
                 }
+                Console.WriteLine();
 
-                Console.WriteLine("\n🔄 Next Step: Analyzing actual code usage...");
-                
-                // Load DLL references for semantic analysis
+                // Step 3: Load DLL references
+                Console.WriteLine($"[Step 3/5] 🔧 Loading assembly references for semantic analysis...");
+                var stepStart = stopwatch.ElapsedMilliseconds;
                 var metadataReferences = LoadMetadataReferences(solutionDir, projectInfos, binPaths);
-                
+                Console.WriteLine($"[Step 3/5] ✅ Assembly references loaded ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
+                Console.WriteLine();
+
+                // Step 4: Analyze code usage
+                Console.WriteLine($"[Step 4/5] 🔬 Analyzing code usage with Roslyn semantic analysis...");
+                stepStart = stopwatch.ElapsedMilliseconds;
                 var analysisResults = await AnalyzeCodeUsageByProjectAsync(projectInfos, matchedPackages.Keys.ToArray(), metadataReferences);
+                Console.WriteLine($"[Step 4/5] ✅ Code usage analysis complete ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
+                Console.WriteLine();
+
+                // Step 5: Analyze DLL manifests
+                Console.WriteLine($"[Step 5/5] 🔎 Analyzing DLL assembly manifests for migration blockers...");
+                stepStart = stopwatch.ElapsedMilliseconds;
+                List<DllManifestAnalysis> manifestResults;
+                try
+                {
+                    manifestResults = AnalyzeDllManifests(solutionDir, projectInfos, matchedPackages, binPaths);
+                    Console.WriteLine($"[Step 5/5] ✅ Manifest analysis complete ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
+                }
+                catch (Exception ex)
+                {
+                    manifestResults = new List<DllManifestAnalysis>();
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine($"[Step 5/5] ⚠️  Manifest analysis failed: {ex.Message}");
+                    Console.ResetColor();
+                }
                 
                 // Display console summary
                 DisplayConsoleSummary(analysisResults);
+                DisplayManifestAnalysisSummary(manifestResults);
                 
                 // Generate HTML report
                 if (!string.IsNullOrEmpty(outputFile))
                 {
-                    GenerateHtmlReport(solutionPath, analysisResults, outputFile);
-                    Console.WriteLine($"\n📄 HTML report generated: {Path.GetFullPath(outputFile)}");
+                    Console.WriteLine("\n📝 Generating HTML report...");
+                    GenerateHtmlReport(solutionPath, analysisResults, manifestResults, outputFile);
+                    Console.WriteLine($"📄 HTML report generated: {Path.GetFullPath(outputFile)}");
                 }
+
+                Console.WriteLine($"\n⏱️  Total elapsed time: {stopwatch.ElapsedMilliseconds}ms");
             }
             else
             {
@@ -224,13 +268,12 @@ namespace DotNetCrawler
 
         static List<MetadataReference> LoadMetadataReferences(string solutionDir, List<ProjectInfo> projects, string[] binPaths)
         {
-            Console.WriteLine("\n🔧 Loading assembly references for semantic analysis...");
-            
             var references = new List<MetadataReference>();
             var loadedDlls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             // Add framework references
             var frameworkPath = System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory();
+            Console.WriteLine($"   Loading .NET Framework base assemblies from: {frameworkPath}");
             var frameworkDlls = new[] { "mscorlib.dll", "System.dll", "System.Core.dll", "System.Xml.dll", "System.Linq.dll" };
             
             foreach (var dll in frameworkDlls)
@@ -246,16 +289,19 @@ namespace DotNetCrawler
                     catch { /* Skip if can't load */ }
                 }
             }
+            Console.WriteLine($"   ✓ {loadedDlls.Count} framework assemblies loaded");
 
             var searchPaths = new List<string>();
 
             // Use provided bin paths
             if (binPaths != null && binPaths.Any())
             {
+                Console.WriteLine($"   Using {binPaths.Length} custom bin path(s)");
                 searchPaths.AddRange(binPaths);
             }
             else
             {
+                Console.WriteLine("   Auto-detecting assembly search paths...");
                 // Auto-detect bin folders
                 foreach (var project in projects)
                 {
@@ -273,14 +319,23 @@ namespace DotNetCrawler
                 var packagesFolder = Path.Combine(solutionDir, "packages");
                 if (Directory.Exists(packagesFolder))
                 {
+                    Console.WriteLine($"   Found NuGet packages folder: {packagesFolder}");
                     var packageDllFolders = Directory.GetDirectories(packagesFolder, "*", SearchOption.AllDirectories)
                         .Where(d => d.Contains("\\lib\\") && !d.Contains("\\build\\"));
                     searchPaths.AddRange(packageDllFolders);
                 }
+                else
+                {
+                    Console.WriteLine("   ⚠️  No 'packages' folder found (NuGet packages may not be restored)");
+                }
             }
 
+            var distinctPaths = searchPaths.Distinct().ToList();
+            Console.WriteLine($"   Scanning {distinctPaths.Count} search path(s) for DLLs...");
+
             // Load DLLs from all search paths
-            foreach (var searchPath in searchPaths.Distinct())
+            var failedDlls = 0;
+            foreach (var searchPath in distinctPaths)
             {
                 if (!Directory.Exists(searchPath))
                     continue;
@@ -300,24 +355,26 @@ namespace DotNetCrawler
                     }
                     catch
                     {
-                        Console.WriteLine($"   DLL {dllName} not loaded ! ");
+                        failedDlls++;
                         // Skip DLLs that can't be loaded
                     }
                 }
             }
 
             Console.WriteLine($"   ✅ Loaded {references.Count} assembly references");
+            if (failedDlls > 0)
+                Console.WriteLine($"   ⚠️  {failedDlls} DLL(s) could not be loaded");
             return references;
         }
 
         static async Task<List<ProjectAnalysisResult>> AnalyzeCodeUsageByProjectAsync(List<ProjectInfo> projects, string[] packageNames, List<MetadataReference> metadataReferences)
         {
-            Console.WriteLine("\n🔬 Analyzing code usage with semantic analysis...");
-
             var results = new List<ProjectAnalysisResult>();
+            var projIndex = 0;
 
             foreach (var projectInfo in projects)
             {
+                projIndex++;
                 var projectResult = new ProjectAnalysisResult
                 {
                     ProjectName = projectInfo.Name,
@@ -334,6 +391,14 @@ namespace DotNetCrawler
                     .Where(p => packageNames.Contains(p.Item1, StringComparer.OrdinalIgnoreCase))
                     .ToList();
 
+                Console.WriteLine($"   [{projIndex}/{projects.Count}] 📁 {projectInfo.Name}: {csFiles.Count} .cs file(s), {matchedPackagesForProject.Count} matched package(s)");
+
+                if (!matchedPackagesForProject.Any())
+                {
+                    results.Add(projectResult);
+                    continue;
+                }
+
                 foreach (var package in matchedPackagesForProject)
                 {
                     var packageUsage = new PackageUsageDetail
@@ -346,8 +411,10 @@ namespace DotNetCrawler
                 }
 
                 // Create a compilation for this project's files
+                Console.WriteLine($"              Parsing {csFiles.Count} source file(s)...");
                 var syntaxTrees = new List<SyntaxTree>();
                 var fileContents = new Dictionary<string, string>();
+                var parseFailures = 0;
 
                 foreach (var csFile in csFiles)
                 {
@@ -358,10 +425,14 @@ namespace DotNetCrawler
                         var tree = CSharpSyntaxTree.ParseText(code, path: csFile);
                         syntaxTrees.Add(tree);
                     }
-                    catch { /* Skip files that can't be read */ }
+                    catch { parseFailures++; }
                 }
 
+                if (parseFailures > 0)
+                    Console.WriteLine($"              ⚠️  {parseFailures} file(s) could not be parsed");
+
                 // Create compilation with all references
+                Console.WriteLine($"              Building Roslyn compilation ({syntaxTrees.Count} trees, {metadataReferences.Count} refs)...");
                 var compilation = CSharpCompilation.Create(
                     projectInfo.Name,
                     syntaxTrees: syntaxTrees,
@@ -370,6 +441,8 @@ namespace DotNetCrawler
                 );
 
                 // Analyze each file with semantic model
+                var filesWithUsage = 0;
+                var analyzeFailures = 0;
                 foreach (var tree in syntaxTrees)
                 {
                     try
@@ -384,6 +457,7 @@ namespace DotNetCrawler
                             .ToHashSet();
 
                         // Check if any package namespaces are used
+                        var fileHasUsage = false;
                         foreach (var packageUsage in projectResult.PackageUsages)
                         {
                             var packageNamespacesInFile = usingDirectives
@@ -392,6 +466,7 @@ namespace DotNetCrawler
 
                             if (packageNamespacesInFile.Any())
                             {
+                                fileHasUsage = true;
                                 // Add namespaces
                                 foreach (var ns in packageNamespacesInFile)
                                 {
@@ -409,12 +484,19 @@ namespace DotNetCrawler
                                 packageUsage.Files.Add(Path.GetFileName(tree.FilePath));
                             }
                         }
+                        if (fileHasUsage) filesWithUsage++;
                     }
                     catch (Exception ex)
                     {
-                        // Ignore files that can't be analyzed
+                        analyzeFailures++;
                     }
                 }
+
+                var totalTypesFound = projectResult.PackageUsages.Sum(p => p.UsedTypes.Count);
+                var totalNamespacesFound = projectResult.PackageUsages.Sum(p => p.UsedNamespaces.Count);
+                Console.WriteLine($"              ✓ {filesWithUsage} file(s) with usage, {totalNamespacesFound} namespace(s), {totalTypesFound} type(s) detected");
+                if (analyzeFailures > 0)
+                    Console.WriteLine($"              ⚠️  {analyzeFailures} file(s) could not be analyzed");
 
                 results.Add(projectResult);
             }
@@ -509,6 +591,18 @@ namespace DotNetCrawler
                                 var typeName = typeSymbol.Name;
                                 packageUsage.TypesByNamespace[ns].Add(typeName);
                                 packageUsage.UsedTypes.Add(typeName);
+                                
+                                // Track type details for migration analysis
+                                if (!packageUsage.TypeDetails.ContainsKey(typeName))
+                                {
+                                    packageUsage.TypeDetails[typeName] = new TypeDetail
+                                    {
+                                        Name = typeName,
+                                        Namespace = containingNamespace,
+                                        AssemblyName = typeSymbol.ContainingAssembly?.Name
+                                    };
+                                }
+                                
                                 break;
                             }
                         }
@@ -545,6 +639,18 @@ namespace DotNetCrawler
                                 var typeName = typeSymbol.Name;
                                 packageUsage.TypesByNamespace[ns].Add(typeName);
                                 packageUsage.UsedTypes.Add(typeName);
+                                
+                                // Track type details
+                                if (!packageUsage.TypeDetails.ContainsKey(typeName))
+                                {
+                                    packageUsage.TypeDetails[typeName] = new TypeDetail
+                                    {
+                                        Name = typeName,
+                                        Namespace = containingNamespace,
+                                        AssemblyName = typeSymbol.ContainingAssembly?.Name
+                                    };
+                                }
+                                
                                 break;
                             }
                         }
@@ -585,6 +691,18 @@ namespace DotNetCrawler
                                         var typeName = symbol.Name;
                                         packageUsage.TypesByNamespace[ns].Add(typeName);
                                         packageUsage.UsedTypes.Add(typeName);
+                                        
+                                        // Track type details
+                                        if (!packageUsage.TypeDetails.ContainsKey(typeName))
+                                        {
+                                            packageUsage.TypeDetails[typeName] = new TypeDetail
+                                            {
+                                                Name = typeName,
+                                                Namespace = containingNamespace,
+                                                AssemblyName = symbol.ContainingAssembly?.Name
+                                            };
+                                        }
+                                        
                                         break;
                                     }
                                 }
@@ -597,9 +715,745 @@ namespace DotNetCrawler
                     }
                 }
             }
+            
+            // Now analyze dependencies for migration compatibility
+            AnalyzeMigrationCompatibility(root, semanticModel, packageUsage);
         }
 
-        static void GenerateHtmlReport(string solutionPath, List<ProjectAnalysisResult> results, string outputFile)
+        static void AnalyzeMigrationCompatibility(SyntaxNode root, SemanticModel semanticModel, PackageUsageDetail packageUsage)
+        {
+            var frameworkSpecificNamespaces = GetFrameworkSpecificNamespaces();
+            var compilation = semanticModel.Compilation;
+            
+            // Analyze the package assembly itself
+            var packageAssemblyInfo = AnalyzePackageAssembly(packageUsage.PackageName, compilation);
+            packageUsage.PackageTargetFramework = packageAssemblyInfo.TargetFramework;
+            packageUsage.PackageAssemblyDependencies = packageAssemblyInfo.Dependencies;
+            
+            foreach (var typeDetail in packageUsage.TypeDetails.Values)
+            {
+                var dependencies = new HashSet<string>();
+                
+                // Get all type symbols used in the code
+                var allIdentifiers = root.DescendantNodes()
+                    .OfType<IdentifierNameSyntax>();
+
+                foreach (var identifier in allIdentifiers)
+                {
+                    try
+                    {
+                        var symbolInfo = semanticModel.GetSymbolInfo(identifier);
+                        var symbol = symbolInfo.Symbol;
+
+                        if (symbol == null)
+                            continue;
+
+                        var containingNamespace = symbol.ContainingNamespace?.ToDisplayString();
+                        var assemblyName = symbol.ContainingAssembly?.Name;
+
+                        if (!string.IsNullOrEmpty(containingNamespace) && !string.IsNullOrEmpty(assemblyName))
+                        {
+                            // Check if this is a framework-specific dependency
+                            foreach (var fwNs in frameworkSpecificNamespaces)
+                            {
+                                if (containingNamespace.StartsWith(fwNs.Key, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    dependencies.Add($"{containingNamespace} ({fwNs.Value})");
+                                    break;
+                                }
+                            }
+                            
+                            // Check if assembly itself is framework-only
+                            var isFrameworkOnlyAssembly = IsFrameworkOnlyAssembly(assemblyName);
+                            if (isFrameworkOnlyAssembly != null)
+                            {
+                                dependencies.Add($"{assemblyName} ({isFrameworkOnlyAssembly})");
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Skip
+                    }
+                }
+
+                typeDetail.FrameworkDependencies = dependencies.ToList();
+                typeDetail.IsNetStandardCompatible = !dependencies.Any() && 
+                    !packageUsage.PackageAssemblyDependencies.Any(d => d.IsFrameworkOnly);
+            }
+        }
+
+        static AssemblyAnalysisInfo AnalyzePackageAssembly(string packageName, Compilation compilation)
+        {
+            var info = new AssemblyAnalysisInfo
+            {
+                PackageName = packageName
+            };
+
+            try
+            {
+                // Find the assembly in the compilation references
+                var packageAssembly = compilation.References
+                    .OfType<PortableExecutableReference>()
+                    .Select(r => compilation.GetAssemblyOrModuleSymbol(r) as IAssemblySymbol)
+                    .FirstOrDefault(a => a != null && a.Name.Equals(packageName, StringComparison.OrdinalIgnoreCase));
+
+                if (packageAssembly != null)
+                {
+                    // Try to determine target framework from assembly metadata
+                    var targetFrameworkAttr = packageAssembly.GetAttributes()
+                        .FirstOrDefault(a => a.AttributeClass?.Name == "TargetFrameworkAttribute");
+                    
+                    if (targetFrameworkAttr != null && targetFrameworkAttr.ConstructorArguments.Length > 0)
+                    {
+                        info.TargetFramework = targetFrameworkAttr.ConstructorArguments[0].Value?.ToString() ?? "Unknown";
+                    }
+
+                    // Get assembly references (dependencies)
+                    foreach (var module in packageAssembly.Modules)
+                    {
+                        foreach (var referencedAssembly in module.ReferencedAssemblies)
+                        {
+                            var depName = referencedAssembly.Name;
+                            var isFrameworkOnly = IsFrameworkOnlyAssembly(depName);
+                            
+                            info.Dependencies.Add(new AssemblyDependency
+                            {
+                                Name = depName,
+                                Version = referencedAssembly.Version.ToString(),
+                                IsFrameworkOnly = isFrameworkOnly != null,
+                                FrameworkOnlyReason = isFrameworkOnly
+                            });
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Can't analyze assembly
+            }
+
+            return info;
+        }
+
+        static void SafeAdd(Dictionary<string, string> dict, string key, string value)
+        {
+            if (!dict.ContainsKey(key))
+                dict[key] = value;
+        }
+
+        static string IsFrameworkOnlyAssembly(string assemblyName)
+        {
+            var frameworkOnlyAssemblies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                // Entity Framework 6.x
+                { "EntityFramework", "Entity Framework 6.x (Use EF Core for .NET Standard)" },
+                { "EntityFramework.SqlServer", "Entity Framework 6.x" },
+                { "EntityFramework.SqlServerCompact", "Entity Framework 6.x" },
+                
+                // ASP.NET (Classic)
+                { "System.Web", "ASP.NET (Classic) - Migrate to ASP.NET Core" },
+                { "System.Web.Mvc", "ASP.NET MVC - Migrate to ASP.NET Core MVC" },
+                { "System.Web.Http", "ASP.NET Web API - Migrate to ASP.NET Core Web API" },
+                { "System.Web.WebPages", "ASP.NET Web Pages - Migrate to Razor Pages" },
+                { "System.Web.Razor", "ASP.NET Razor (Classic)" },
+                { "System.Web.Optimization", "ASP.NET Bundling (.NET Framework only)" },
+                { "System.Web.Extensions", "ASP.NET AJAX Extensions (.NET Framework only)" },
+                { "System.Web.Services", "ASP.NET Web Services (ASMX) - Use Web API/gRPC" },
+                { "System.Web.ApplicationServices", "ASP.NET Application Services (.NET Framework only)" },
+                { "System.Web.DynamicData", "ASP.NET Dynamic Data (.NET Framework only)" },
+                { "System.Web.Entity", "ASP.NET Entity Data Source (.NET Framework only)" },
+                { "System.Web.Routing", "ASP.NET Routing (Classic) - Built into ASP.NET Core" },
+                
+                // WCF
+                { "System.ServiceModel", "WCF - Consider gRPC or ASP.NET Core Web API" },
+                { "System.ServiceModel.Web", "WCF Web HTTP - Migrate to ASP.NET Core Web API" },
+                { "System.ServiceModel.Activation", "WCF Activation (.NET Framework only)" },
+                
+                // Windows-specific
+                { "System.Windows.Forms", "Windows Forms" },
+                { "PresentationCore", "WPF" },
+                { "PresentationFramework", "WPF" },
+                { "WindowsBase", "WPF" },
+                
+                // Configuration
+                { "System.Configuration", ".NET Framework Configuration - Use Microsoft.Extensions.Configuration" },
+                { "System.Configuration.ConfigurationManager", "ConfigurationManager (Limited .NET Standard support)" },
+                
+                // SignalR (old)
+                { "Microsoft.AspNet.SignalR", "SignalR (Classic) - Migrate to ASP.NET Core SignalR" },
+                { "Microsoft.AspNet.SignalR.Core", "SignalR (Classic)" },
+                { "Microsoft.AspNet.SignalR.SystemWeb", "SignalR SystemWeb (.NET Framework only)" },
+                
+                // Identity (old)
+                { "Microsoft.AspNet.Identity", "ASP.NET Identity (Classic) - Migrate to ASP.NET Core Identity" },
+                { "Microsoft.AspNet.Identity.Core", "ASP.NET Identity (Classic)" },
+                { "Microsoft.AspNet.Identity.EntityFramework", "ASP.NET Identity EF (Classic)" },
+                { "Microsoft.AspNet.Identity.Owin", "ASP.NET Identity OWIN (Classic)" },
+                
+                // OWIN
+                { "Microsoft.Owin", "OWIN (.NET Framework only)" },
+                { "Microsoft.Owin.Host.SystemWeb", "OWIN SystemWeb Host (.NET Framework only)" },
+                { "Microsoft.Owin.Security", "OWIN Security (.NET Framework only)" },
+                { "Microsoft.Owin.Security.OAuth", "OWIN OAuth (.NET Framework only)" },
+                { "Microsoft.Owin.Security.Cookies", "OWIN Cookie Auth (.NET Framework only)" },
+                { "Owin", "OWIN interface (.NET Framework only)" },
+                
+                // Logging (framework-only versions)
+                { "log4net", "log4net (versions < 2.0.8 are .NET Framework only)" },
+                { "Common.Logging", "Common.Logging (.NET Framework only - Use Microsoft.Extensions.Logging)" },
+                { "Common.Logging.Core", "Common.Logging (.NET Framework only)" },
+                
+                // IoC/DI Containers (old framework-only versions)
+                { "Microsoft.Practices.Unity", "Unity (old) - Use Microsoft.Extensions.DependencyInjection or Unity 5+" },
+                { "Microsoft.Practices.Unity.Configuration", "Unity Configuration (old, .NET Framework only)" },
+                { "Microsoft.Practices.Unity.Interception", "Unity Interception (old, .NET Framework only)" },
+                { "Ninject", "Ninject (versions < 3.3 are .NET Framework only)" },
+                { "Ninject.Web.Common", "Ninject Web Common (.NET Framework only)" },
+                { "StructureMap", "StructureMap (.NET Framework only - Use Lamar for .NET Core)" },
+                { "Spring.Core", "Spring.NET (.NET Framework only)" },
+                { "Spring.Web", "Spring.NET Web (.NET Framework only)" },
+                { "Spring.Data", "Spring.NET Data (.NET Framework only)" },
+                
+                // ORM (framework-only versions)
+                { "NHibernate", "NHibernate (versions < 5.2 are .NET Framework only)" },
+                { "FluentNHibernate", "FluentNHibernate (.NET Framework only)" },
+                { "Iesi.Collections", "Iesi.Collections (NHibernate dependency, .NET Framework only)" },
+                
+                // Enterprise Library
+                { "EnterpriseLibrary", "Enterprise Library (.NET Framework only)" },
+                { "Microsoft.Practices.EnterpriseLibrary.Common", "Enterprise Library (.NET Framework only)" },
+                { "Microsoft.Practices.EnterpriseLibrary.Data", "Enterprise Library Data (.NET Framework only)" },
+                { "Microsoft.Practices.EnterpriseLibrary.Logging", "Enterprise Library Logging (.NET Framework only)" },
+                { "Microsoft.Practices.EnterpriseLibrary.ExceptionHandling", "Enterprise Library (.NET Framework only)" },
+                { "Microsoft.Practices.EnterpriseLibrary.Caching", "Enterprise Library Caching (.NET Framework only)" },
+                { "Microsoft.Practices.EnterpriseLibrary.Validation", "Enterprise Library Validation (.NET Framework only)" },
+                { "Microsoft.Practices.EnterpriseLibrary.Security", "Enterprise Library Security (.NET Framework only)" },
+                { "Microsoft.Practices.EnterpriseLibrary.PolicyInjection", "Enterprise Library (.NET Framework only)" },
+                
+                // Windows Azure (legacy)
+                { "Microsoft.WindowsAzure.Storage", "Legacy Azure Storage - Use Azure.Storage.Blobs" },
+                { "Microsoft.WindowsAzure.ConfigurationManager", "Legacy Azure Configuration" },
+                { "Microsoft.WindowsAzure.ServiceRuntime", "Azure Cloud Services Runtime (.NET Framework only)" },
+                { "Microsoft.WindowsAzure.Diagnostics", "Azure Cloud Services Diagnostics (.NET Framework only)" },
+                
+                // ASP.NET Web Optimization / Bundling
+                { "Microsoft.AspNet.Web.Optimization", "ASP.NET Bundling (.NET Framework only)" },
+                { "WebGrease", "WebGrease (.NET Framework only)" },
+                { "Antlr3.Runtime", "ANTLR 3 (Classic, bundled with ASP.NET)" },
+                
+                // Misc .NET Framework-only
+                { "Microsoft.Web.Infrastructure", "Microsoft.Web.Infrastructure (.NET Framework only)" },
+                { "Microsoft.CodeDom.Providers.DotNetCompilerPlatform", "Roslyn CodeDom (.NET Framework only)" },
+                { "Microsoft.Net.Compilers", ".NET Framework Compilers (not needed in .NET Core)" },
+                { "DotNetOpenAuth", "DotNetOpenAuth (.NET Framework only)" },
+                { "DotNetOpenAuth.Core", "DotNetOpenAuth (.NET Framework only)" },
+                
+                // Reporting
+                { "Microsoft.ReportViewer.WebForms", "Report Viewer WebForms (.NET Framework only)" },
+                { "Microsoft.ReportViewer.WinForms", "Report Viewer WinForms (.NET Framework only)" },
+                { "Microsoft.ReportViewer.Common", "Report Viewer (.NET Framework only)" },
+                { "CrystalDecisions.CrystalReports.Engine", "Crystal Reports (.NET Framework only)" },
+                { "CrystalDecisions.Shared", "Crystal Reports (.NET Framework only)" },
+                
+                // Remoting / Runtime
+                { "System.Runtime.Remoting", ".NET Remoting (.NET Framework only)" },
+                { "System.EnterpriseServices", "COM+ Enterprise Services (.NET Framework only)" },
+                
+                // Workflow
+                { "System.Workflow.Runtime", "Windows Workflow Foundation 3.x (.NET Framework only)" },
+                { "System.Workflow.Activities", "Windows Workflow Foundation 3.x (.NET Framework only)" },
+                { "System.Workflow.ComponentModel", "Windows Workflow Foundation 3.x (.NET Framework only)" },
+                { "System.Activities", "Windows Workflow Foundation 4.x (.NET Framework only)" },
+                { "System.Activities.Core.Presentation", "WF Designer (.NET Framework only)" },
+                
+                // Transactions (old)
+                { "System.Transactions", ".NET Framework Transactions - Use System.Transactions in .NET Core 3.0+" }
+            };
+
+            return frameworkOnlyAssemblies.ContainsKey(assemblyName) 
+                ? frameworkOnlyAssemblies[assemblyName] 
+                : null;
+        }
+
+        static Dictionary<string, string> GetFrameworkSpecificNamespaces()
+        {
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                // Entity Framework 6.x (Framework-only)
+                { "System.Data.Entity", "Entity Framework 6.x" },
+                { "EntityFramework", "Entity Framework 6.x" },
+                
+                // ASP.NET (Classic)
+                { "System.Web", "ASP.NET (Classic)" },
+                { "System.Web.Mvc", "ASP.NET MVC" },
+                { "System.Web.Http", "ASP.NET Web API" },
+                { "System.Web.UI", "ASP.NET Web Forms" },
+                
+                // WCF
+                { "System.ServiceModel", "WCF (Windows Communication Foundation)" },
+                
+                // Windows-specific
+                { "System.Windows.Forms", "Windows Forms" },
+                { "System.Windows", "WPF" },
+                { "System.Windows.Controls", "WPF" },
+                { "System.Xaml", "XAML (WPF)" },
+                
+                // Configuration (old style)
+                { "System.Configuration", ".NET Framework Configuration" },
+                
+                // Remoting
+                { "System.Runtime.Remoting", ".NET Remoting" },
+                
+                // Enterprise Services
+                { "System.EnterpriseServices", "COM+ Services" },
+                
+                // Workflow
+                { "System.Workflow", "Windows Workflow Foundation" },
+                { "System.Activities", "Windows Workflow Foundation" },
+                
+                // ClickOnce
+                { "System.Deployment", "ClickOnce Deployment" },
+                
+                // DirectoryServices
+                { "System.DirectoryServices", "Active Directory (Limited in .NET Standard)" },
+                
+                // Drawing (limited support)
+                { "System.Drawing", "System.Drawing (Limited .NET Core support)" }
+            };
+        }
+
+        static Dictionary<string, string> GetFrameworkOnlyNuGetPackages()
+        {
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            // Logging
+            SafeAdd(dict, "log4net", "log4net (versions < 2.0.8 are .NET Framework only) - Use Microsoft.Extensions.Logging / Serilog / NLog");
+            SafeAdd(dict, "Common.Logging", "Common.Logging (.NET Framework only) - Use Microsoft.Extensions.Logging");
+            SafeAdd(dict, "Common.Logging.Core", "Common.Logging (.NET Framework only)");
+            SafeAdd(dict, "Common.Logging.Log4Net", "Common.Logging log4net adapter (.NET Framework only)");
+            SafeAdd(dict, "Common.Logging.NLog", "Common.Logging NLog adapter (.NET Framework only)");
+
+            // ORM / Data Access
+            SafeAdd(dict, "EntityFramework", "Entity Framework 6.x (versions < 6.3 .NET Framework only) - Use EF Core");
+            SafeAdd(dict, "EntityFramework.SqlServer", "Entity Framework 6.x (.NET Framework only)");
+            SafeAdd(dict, "EntityFramework.SqlServerCompact", "Entity Framework 6.x (.NET Framework only)");
+            SafeAdd(dict, "NHibernate", "NHibernate (versions < 5.2 .NET Framework only) - Use EF Core or upgrade NHibernate");
+            SafeAdd(dict, "FluentNHibernate", "FluentNHibernate (.NET Framework only)");
+            SafeAdd(dict, "Iesi.Collections", "Iesi.Collections - NHibernate dependency (.NET Framework only)");
+            SafeAdd(dict, "LinqToExcel", "LinqToExcel (.NET Framework only)");
+
+            // IoC / Dependency Injection (old framework-only versions)
+            SafeAdd(dict, "Microsoft.Practices.Unity", "Unity (old) - Use Microsoft.Extensions.DependencyInjection or Unity 5+");
+            SafeAdd(dict, "Microsoft.Practices.Unity.Configuration", "Unity Configuration (old, .NET Framework only)");
+            SafeAdd(dict, "Microsoft.Practices.Unity.Interception", "Unity Interception (old, .NET Framework only)");
+            SafeAdd(dict, "Unity.Mvc", "Unity MVC integration (.NET Framework only)");
+            SafeAdd(dict, "Unity.WebApi", "Unity Web API integration (.NET Framework only)");
+            SafeAdd(dict, "Ninject", "Ninject (versions < 3.3 .NET Framework only)");
+            SafeAdd(dict, "Ninject.Web.Common", "Ninject Web (.NET Framework only)");
+            SafeAdd(dict, "Ninject.MVC3", "Ninject MVC (.NET Framework only)");
+            SafeAdd(dict, "Ninject.MVC5", "Ninject MVC5 (.NET Framework only)");
+            SafeAdd(dict, "StructureMap", "StructureMap (.NET Framework only) - Use Lamar for .NET Core");
+            SafeAdd(dict, "StructureMap.MVC5", "StructureMap MVC5 (.NET Framework only)");
+            SafeAdd(dict, "Spring.Core", "Spring.NET (.NET Framework only)");
+            SafeAdd(dict, "Spring.Web", "Spring.NET Web (.NET Framework only)");
+            SafeAdd(dict, "Spring.Data", "Spring.NET Data (.NET Framework only)");
+            SafeAdd(dict, "Spring.Aop", "Spring.NET AOP (.NET Framework only)");
+
+            // ASP.NET Classic
+            SafeAdd(dict, "Microsoft.AspNet.Mvc", "ASP.NET MVC (Classic) - Migrate to ASP.NET Core MVC");
+            SafeAdd(dict, "Microsoft.AspNet.WebApi", "ASP.NET Web API (Classic) - Migrate to ASP.NET Core");
+            SafeAdd(dict, "Microsoft.AspNet.WebApi.Core", "ASP.NET Web API (Classic)");
+            SafeAdd(dict, "Microsoft.AspNet.WebApi.Client", "ASP.NET Web API Client (Classic)");
+            SafeAdd(dict, "Microsoft.AspNet.WebApi.WebHost", "ASP.NET Web API WebHost (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.AspNet.WebApi.Owin", "ASP.NET Web API OWIN (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.AspNet.WebPages", "ASP.NET Web Pages (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.AspNet.Razor", "ASP.NET Razor (Classic, .NET Framework only)");
+            SafeAdd(dict, "Microsoft.AspNet.SignalR", "SignalR (Classic) - Migrate to ASP.NET Core SignalR");
+            SafeAdd(dict, "Microsoft.AspNet.SignalR.Core", "SignalR (Classic)");
+            SafeAdd(dict, "Microsoft.AspNet.SignalR.SystemWeb", "SignalR SystemWeb (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.AspNet.SignalR.JS", "SignalR JS (Classic)");
+            SafeAdd(dict, "Microsoft.AspNet.Identity.Core", "ASP.NET Identity (Classic) - Migrate to ASP.NET Core Identity");
+            SafeAdd(dict, "Microsoft.AspNet.Identity.EntityFramework", "ASP.NET Identity EF (Classic)");
+            SafeAdd(dict, "Microsoft.AspNet.Identity.Owin", "ASP.NET Identity OWIN (Classic)");
+            SafeAdd(dict, "Microsoft.AspNet.Web.Optimization", "ASP.NET Bundling (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.AspNet.FriendlyUrls", "ASP.NET Friendly URLs (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.AspNet.Providers", "ASP.NET Universal Providers (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.AspNet.Membership.OpenAuth", "ASP.NET OpenAuth (.NET Framework only)");
+
+            // OWIN
+            SafeAdd(dict, "Microsoft.Owin", "OWIN (.NET Framework only) - Middleware built into ASP.NET Core");
+            SafeAdd(dict, "Microsoft.Owin.Host.SystemWeb", "OWIN SystemWeb Host (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Owin.Host.HttpListener", "OWIN HttpListener Host (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Owin.Security", "OWIN Security (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Owin.Security.OAuth", "OWIN OAuth (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Owin.Security.Cookies", "OWIN Cookie Auth (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Owin.Security.ActiveDirectory", "OWIN AD Auth (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Owin.Security.Google", "OWIN Google Auth (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Owin.Security.Facebook", "OWIN Facebook Auth (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Owin.Security.MicrosoftAccount", "OWIN Microsoft Auth (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Owin.Security.Twitter", "OWIN Twitter Auth (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Owin.Cors", "OWIN CORS (.NET Framework only)");
+            SafeAdd(dict, "Owin", "OWIN interface (.NET Framework only)");
+
+            // Enterprise Library
+            SafeAdd(dict, "EnterpriseLibrary.Common", "Enterprise Library (.NET Framework only)");
+            SafeAdd(dict, "EnterpriseLibrary.Data", "Enterprise Library Data (.NET Framework only) - Use Dapper / EF Core");
+            SafeAdd(dict, "EnterpriseLibrary.Logging", "Enterprise Library Logging (.NET Framework only) - Use Microsoft.Extensions.Logging");
+            SafeAdd(dict, "EnterpriseLibrary.ExceptionHandling", "Enterprise Library Exception Handling (.NET Framework only)");
+            SafeAdd(dict, "EnterpriseLibrary.Caching", "Enterprise Library Caching (.NET Framework only) - Use IMemoryCache");
+            SafeAdd(dict, "EnterpriseLibrary.Validation", "Enterprise Library Validation (.NET Framework only) - Use FluentValidation");
+            SafeAdd(dict, "EnterpriseLibrary.Security.Cryptography", "Enterprise Library Crypto (.NET Framework only)");
+            SafeAdd(dict, "EnterpriseLibrary.PolicyInjection", "Enterprise Library Policy Injection (.NET Framework only)");
+            SafeAdd(dict, "EnterpriseLibrary.TransientFaultHandling", "Enterprise Library Transient Fault Handling (.NET Framework only) - Use Polly");
+            SafeAdd(dict, "Microsoft.Practices.EnterpriseLibrary.Common", "Enterprise Library (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Practices.EnterpriseLibrary.Data", "Enterprise Library Data (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Practices.EnterpriseLibrary.Logging", "Enterprise Library Logging (.NET Framework only)");
+
+            // Azure (legacy SDKs)
+            SafeAdd(dict, "Microsoft.WindowsAzure.Storage", "Legacy Azure Storage - Use Azure.Storage.Blobs");
+            SafeAdd(dict, "Microsoft.WindowsAzure.ConfigurationManager", "Legacy Azure Configuration");
+            SafeAdd(dict, "Microsoft.WindowsAzure.ServiceRuntime", "Azure Cloud Services (.NET Framework only)");
+            SafeAdd(dict, "WindowsAzure.Storage", "Legacy Azure Storage - Use Azure.Storage.Blobs");
+            SafeAdd(dict, "WindowsAzure.ServiceBus", "Legacy Azure Service Bus - Use Azure.Messaging.ServiceBus");
+
+            // Web / HTTP (old)
+            SafeAdd(dict, "Microsoft.Web.Infrastructure", "Microsoft.Web.Infrastructure (.NET Framework only)");
+            SafeAdd(dict, "WebGrease", "WebGrease (.NET Framework only)");
+            SafeAdd(dict, "Antlr", "ANTLR (Classic ASP.NET bundling dependency)");
+
+            // Authentication (old)
+            SafeAdd(dict, "DotNetOpenAuth", "DotNetOpenAuth (.NET Framework only)");
+            SafeAdd(dict, "DotNetOpenAuth.Core", "DotNetOpenAuth (.NET Framework only)");
+            SafeAdd(dict, "DotNetOpenAuth.AspNet", "DotNetOpenAuth ASP.NET (.NET Framework only)");
+
+            // Build / Compilation
+            SafeAdd(dict, "Microsoft.CodeDom.Providers.DotNetCompilerPlatform", "Roslyn CodeDom (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.Net.Compilers", ".NET Framework Compilers (not needed in .NET Core)");
+            SafeAdd(dict, "Microsoft.Net.Compilers.Toolset", ".NET Framework Compilers (not needed in .NET Core)");
+
+            // Reporting
+            SafeAdd(dict, "Microsoft.ReportViewer.WebForms", "Report Viewer WebForms (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.ReportViewer.WinForms", "Report Viewer WinForms (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.ReportViewer.Common", "Report Viewer (.NET Framework only)");
+            SafeAdd(dict, "CrystalDecisions.CrystalReports.Engine", "Crystal Reports (.NET Framework only)");
+
+            // WCF
+            SafeAdd(dict, "System.ServiceModel", "WCF (.NET Framework only) - Use gRPC or ASP.NET Core Web API");
+
+            // Misc
+            SafeAdd(dict, "System.Web.Optimization", "ASP.NET Bundling (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.AspNet.ScriptManager.MSAjax", "ASP.NET AJAX (.NET Framework only)");
+            SafeAdd(dict, "Microsoft.AspNet.ScriptManager.WebForms", "ASP.NET WebForms Scripts (.NET Framework only)");
+            SafeAdd(dict, "AjaxControlToolkit", "ASP.NET AJAX Control Toolkit (.NET Framework only)");
+
+            return dict;
+        }
+
+        static List<DllManifestAnalysis> AnalyzeDllManifests(
+            string solutionDir,
+            List<ProjectInfo> projects,
+            Dictionary<string, HashSet<string>> matchedPackages,
+            string[] binPaths)
+        {
+            var results = new List<DllManifestAnalysis>();
+            var frameworkOnlyNuGets = GetFrameworkOnlyNuGetPackages();
+            Console.WriteLine($"   Loaded {frameworkOnlyNuGets.Count} known .NET Framework-only NuGet entries");
+
+            // Build search paths for DLL files
+            var dllSearchPaths = new List<string>();
+
+            if (binPaths != null && binPaths.Any())
+            {
+                Console.WriteLine($"   Using {binPaths.Length} custom bin path(s) for DLL discovery");
+                dllSearchPaths.AddRange(binPaths);
+            }
+            else
+            {
+                Console.WriteLine("   Auto-detecting DLL search paths...");
+                foreach (var project in projects)
+                {
+                    var projectDir = Path.GetDirectoryName(project.Path);
+                    var binDebug = Path.Combine(projectDir, "bin", "Debug");
+                    var binRelease = Path.Combine(projectDir, "bin", "Release");
+
+                    if (Directory.Exists(binRelease))
+                    {
+                        foreach (var dir in Directory.GetDirectories(binRelease, "*", SearchOption.AllDirectories))
+                            dllSearchPaths.Add(dir);
+                        dllSearchPaths.Add(binRelease);
+                    }
+                    if (Directory.Exists(binDebug))
+                    {
+                        foreach (var dir in Directory.GetDirectories(binDebug, "*", SearchOption.AllDirectories))
+                            dllSearchPaths.Add(dir);
+                        dllSearchPaths.Add(binDebug);
+                    }
+                }
+
+                var packagesFolder = Path.Combine(solutionDir, "packages");
+                if (Directory.Exists(packagesFolder))
+                {
+                    var packageDllFolders = Directory.GetDirectories(packagesFolder, "*", SearchOption.AllDirectories)
+                        .Where(d => d.Contains("\\lib\\"));
+                    dllSearchPaths.AddRange(packageDllFolders);
+                }
+            }
+
+            var distinctDllPaths = dllSearchPaths.Distinct().ToList();
+            Console.WriteLine($"   {distinctDllPaths.Count} search path(s) available for DLL lookup");
+            Console.WriteLine($"   Scanning {matchedPackages.Count} matched package(s)...");
+            Console.WriteLine();
+
+            // Set up reflection-only assembly resolve handler
+            ResolveEventHandler resolveHandler = (sender, args) =>
+            {
+                try
+                {
+                    return System.Reflection.Assembly.ReflectionOnlyLoad(args.Name);
+                }
+                catch
+                {
+                    // Try to find it in our search paths
+                    var asmName = new AssemblyName(args.Name);
+                    foreach (var searchPath in dllSearchPaths)
+                    {
+                        var candidatePath = Path.Combine(searchPath, asmName.Name + ".dll");
+                        if (File.Exists(candidatePath))
+                        {
+                            try
+                            {
+                                return System.Reflection.Assembly.ReflectionOnlyLoadFrom(candidatePath);
+                            }
+                            catch { }
+                        }
+                    }
+                    return null;
+                }
+            };
+
+            AppDomain.CurrentDomain.ReflectionOnlyAssemblyResolve += resolveHandler;
+
+            try
+            {
+                var pkgIndex = 0;
+                foreach (var packageName in matchedPackages.Keys)
+                {
+                    pkgIndex++;
+                    Console.Write($"   [{pkgIndex}/{matchedPackages.Count}] {packageName}: ");
+                    var dllPath = FindPackageDll(dllSearchPaths, packageName);
+
+                    var analysis = new DllManifestAnalysis
+                    {
+                        PackageName = packageName,
+                        DllPath = dllPath
+                    };
+
+                    if (dllPath == null)
+                    {
+                        analysis.Error = "DLL not found in search paths";
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine("DLL not found in search paths");
+                        Console.ResetColor();
+                        results.Add(analysis);
+                        continue;
+                    }
+
+                    Console.WriteLine($"found at {Path.GetFileName(dllPath)}");
+
+                    try
+                    {
+                        var assembly = System.Reflection.Assembly.ReflectionOnlyLoadFrom(dllPath);
+                        analysis.AssemblyFullName = assembly.FullName;
+
+                        // Read TargetFrameworkAttribute
+                        try
+                        {
+                            var customAttrs = CustomAttributeData.GetCustomAttributes(assembly);
+                            var tfAttr = customAttrs
+                                .FirstOrDefault(a => a.AttributeType.Name == "TargetFrameworkAttribute");
+                            if (tfAttr != null && tfAttr.ConstructorArguments.Count > 0)
+                            {
+                                analysis.TargetFramework = tfAttr.ConstructorArguments[0].Value?.ToString();
+                            }
+                        }
+                        catch { }
+
+                        // Get all referenced assemblies from the manifest
+                        var referencedAssemblies = assembly.GetReferencedAssemblies();
+
+                        foreach (var refAsm in referencedAssemblies)
+                        {
+                            var dep = new ManifestDependencyInfo
+                            {
+                                AssemblyName = refAsm.Name,
+                                Version = refAsm.Version?.ToString() ?? "unknown"
+                            };
+
+                            // Check against framework-only assembly list
+                            var assemblyBlocker = IsFrameworkOnlyAssembly(refAsm.Name);
+                            if (assemblyBlocker != null)
+                            {
+                                dep.IsBlocker = true;
+                                dep.BlockerReason = assemblyBlocker;
+                                dep.BlockerCategory = "Framework Assembly";
+                            }
+
+                            // Check against framework-only NuGet package list
+                            if (!dep.IsBlocker && frameworkOnlyNuGets.ContainsKey(refAsm.Name))
+                            {
+                                dep.IsBlocker = true;
+                                dep.BlockerReason = frameworkOnlyNuGets[refAsm.Name];
+                                dep.BlockerCategory = "Framework-Only NuGet";
+                            }
+
+                            analysis.Dependencies.Add(dep);
+                        }
+
+                        var blockerCount = analysis.Dependencies.Count(d => d.IsBlocker);
+                        if (!string.IsNullOrEmpty(analysis.TargetFramework))
+                            Console.WriteLine($"              Target: {analysis.TargetFramework}");
+                        Console.WriteLine($"              {analysis.Dependencies.Count} referenced assembly(ies) in manifest");
+                        if (blockerCount > 0)
+                        {
+                            Console.ForegroundColor = ConsoleColor.Red;
+                            Console.WriteLine($"              ❌ {blockerCount} BLOCKER(S) DETECTED:");
+                            Console.ResetColor();
+                            foreach (var blocker in analysis.Dependencies.Where(d => d.IsBlocker))
+                            {
+                                Console.ForegroundColor = ConsoleColor.Yellow;
+                                Console.WriteLine($"                 → {blocker.AssemblyName} v{blocker.Version} ({blocker.BlockerCategory})");
+                                Console.ResetColor();
+                            }
+                        }
+                        else
+                        {
+                            Console.ForegroundColor = ConsoleColor.Green;
+                            Console.WriteLine($"              ✅ No blockers detected");
+                            Console.ResetColor();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        analysis.Error = ex.Message;
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine($"              ⚠️  Could not read manifest: {ex.Message}");
+                        Console.ResetColor();
+                    }
+
+                    results.Add(analysis);
+                }
+            }
+            finally
+            {
+                AppDomain.CurrentDomain.ReflectionOnlyAssemblyResolve -= resolveHandler;
+            }
+
+            return results;
+        }
+
+        static string FindPackageDll(List<string> searchPaths, string packageName)
+        {
+            // Try exact match first, then partial match
+            foreach (var searchPath in searchPaths.Distinct())
+            {
+                if (!Directory.Exists(searchPath))
+                    continue;
+
+                // Exact match: packageName.dll
+                var exactPath = Path.Combine(searchPath, packageName + ".dll");
+                if (File.Exists(exactPath))
+                    return exactPath;
+            }
+
+            // Try finding in a folder named like the package (common in NuGet packages folder)
+            foreach (var searchPath in searchPaths.Distinct())
+            {
+                if (!Directory.Exists(searchPath))
+                    continue;
+
+                // Check if the search path itself is inside a folder matching the package name
+                if (searchPath.IndexOf(packageName, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    var dlls = Directory.GetFiles(searchPath, "*.dll", SearchOption.TopDirectoryOnly);
+                    var match = dlls.FirstOrDefault(d =>
+                        Path.GetFileNameWithoutExtension(d).Equals(packageName, StringComparison.OrdinalIgnoreCase));
+                    if (match != null)
+                        return match;
+                }
+            }
+
+            return null;
+        }
+
+        static void DisplayManifestAnalysisSummary(List<DllManifestAnalysis> manifestResults)
+        {
+            Console.WriteLine("\n" + new string('=', 60));
+            Console.WriteLine("🔎 DLL MANIFEST DEPENDENCY ANALYSIS");
+            Console.WriteLine(new string('=', 60));
+
+            var analyzedCount = manifestResults.Count(r => r.Error == null);
+            var blockerPackages = manifestResults.Where(r => r.Dependencies.Any(d => d.IsBlocker)).ToList();
+            var cleanPackages = manifestResults.Where(r => r.Error == null && !r.Dependencies.Any(d => d.IsBlocker)).ToList();
+
+            Console.WriteLine($"\n  Packages analyzed: {analyzedCount}");
+            Console.WriteLine($"  With blockers:     {blockerPackages.Count}");
+            Console.WriteLine($"  Clean:             {cleanPackages.Count}");
+
+            if (blockerPackages.Any())
+            {
+                Console.WriteLine("\n  ❌ PACKAGES WITH .NET FRAMEWORK-ONLY DEPENDENCIES:");
+                Console.WriteLine(new string('-', 50));
+
+                foreach (var pkg in blockerPackages)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"\n  📦 {pkg.PackageName}");
+                    Console.ResetColor();
+
+                    if (!string.IsNullOrEmpty(pkg.TargetFramework))
+                    {
+                        Console.WriteLine($"     Target Framework: {pkg.TargetFramework}");
+                    }
+
+                    Console.WriteLine($"     DLL: {Path.GetFileName(pkg.DllPath)}");
+                    Console.WriteLine($"     Blocker dependencies:");
+
+                    foreach (var dep in pkg.Dependencies.Where(d => d.IsBlocker))
+                    {
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine($"       ⚠️  {dep.AssemblyName} v{dep.Version}");
+                        Console.ResetColor();
+                        Console.WriteLine($"          Reason: {dep.BlockerReason}");
+                        Console.WriteLine($"          Category: {dep.BlockerCategory}");
+                    }
+                }
+            }
+
+            if (cleanPackages.Any())
+            {
+                Console.WriteLine("\n  ✅ PACKAGES WITH NO DETECTED BLOCKERS:");
+                Console.WriteLine(new string('-', 50));
+
+                foreach (var pkg in cleanPackages)
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.Write($"  📦 {pkg.PackageName}");
+                    Console.ResetColor();
+
+                    if (!string.IsNullOrEmpty(pkg.TargetFramework))
+                    {
+                        Console.Write($"  (Target: {pkg.TargetFramework})");
+                    }
+
+                    Console.WriteLine($"  [{pkg.Dependencies.Count} deps scanned]");
+                }
+            }
+
+            Console.WriteLine();
+        }
+
+        static void GenerateHtmlReport(string solutionPath, List<ProjectAnalysisResult> results, List<DllManifestAnalysis> manifestResults, string outputFile)
         {
             var html = new StringBuilder();
             var solutionName = Path.GetFileNameWithoutExtension(solutionPath);
@@ -664,6 +1518,62 @@ namespace DotNetCrawler
             html.AppendLine("        .type-usage-project { margin-bottom: 15px; padding: 12px; background: white; border-radius: 4px; border-left: 3px solid #3498db; }");
             html.AppendLine("        .project-label { font-weight: 600; color: #2c3e50; display: block; margin-bottom: 8px; }");
             html.AppendLine("        .type-usage-files { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }");
+            html.AppendLine("        .migration-section { margin-top: 50px; padding-top: 30px; border-top: 3px solid #e0e0e0; }");
+            html.AppendLine("        .migration-title { color: #2c3e50; font-size: 28px; margin-bottom: 10px; }");
+            html.AppendLine("        .migration-description { color: #7f8c8d; margin-bottom: 20px; }");
+            html.AppendLine("        .migration-summary { background: #e8f4f8; padding: 20px; border-radius: 6px; margin-bottom: 30px; }");
+            html.AppendLine("        .migration-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }");
+            html.AppendLine("        .migration-stat { text-align: center; padding: 20px; background: white; border-radius: 6px; }");
+            html.AppendLine("        .migration-stat.compatible { border-left: 4px solid #27ae60; }");
+            html.AppendLine("        .migration-stat.blocked { border-left: 4px solid #e74c3c; }");
+            html.AppendLine("        .stat-number { font-size: 48px; font-weight: bold; margin-bottom: 10px; }");
+            html.AppendLine("        .migration-stat.compatible .stat-number { color: #27ae60; }");
+            html.AppendLine("        .migration-stat.blocked .stat-number { color: #e74c3c; }");
+            html.AppendLine("        .stat-label { color: #7f8c8d; font-size: 14px; }");
+            html.AppendLine("        .migration-group { margin-bottom: 30px; }");
+            html.AppendLine("        .migration-group-title { color: #2c3e50; font-size: 20px; margin-bottom: 8px; }");
+            html.AppendLine("        .migration-group-desc { color: #7f8c8d; margin-bottom: 15px; font-size: 14px; }");
+            html.AppendLine("        .migration-type { background: white; border: 1px solid #e0e0e0; border-radius: 6px; margin-bottom: 10px; overflow: hidden; }");
+            html.AppendLine("        .migration-type-header { padding: 15px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; background: #fff3cd; }");
+            html.AppendLine("        .migration-type-header:hover { background: #ffe8a1; }");
+            html.AppendLine("        .migration-type-name { font-family: 'Courier New', monospace; font-weight: 600; color: #856404; }");
+            html.AppendLine("        .migration-type-detail { display: none; padding: 20px; background: #fafafa; border-top: 1px solid #e0e0e0; }");
+            html.AppendLine("        .dependency-list { margin-top: 15px; padding: 15px; background: #fff; border-radius: 4px; border-left: 3px solid #e74c3c; }");
+            html.AppendLine("        .dependency-list ul { margin: 10px 0 0 20px; }");
+            html.AppendLine("        .dependency-list li { color: #c0392b; margin: 5px 0; }");
+            html.AppendLine("        .compatible-types-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }");
+            html.AppendLine("        .compatible-type-item { padding: 12px; background: #d4edda; border-radius: 4px; border-left: 3px solid #27ae60; }");
+            html.AppendLine("        .compatible-type-name { font-family: 'Courier New', monospace; font-weight: 600; color: #155724; margin-bottom: 4px; }");
+            html.AppendLine("        .compatible-type-ns { font-size: 12px; color: #6c757d; }");
+            html.AppendLine("        .manifest-section { margin-top: 50px; padding-top: 30px; border-top: 3px solid #e74c3c; }");
+            html.AppendLine("        .manifest-title { color: #2c3e50; font-size: 28px; margin-bottom: 10px; }");
+            html.AppendLine("        .manifest-description { color: #7f8c8d; margin-bottom: 20px; }");
+            html.AppendLine("        .manifest-summary { background: #fdf2f2; padding: 20px; border-radius: 6px; margin-bottom: 30px; border-left: 4px solid #e74c3c; }");
+            html.AppendLine("        .manifest-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-top: 15px; }");
+            html.AppendLine("        .manifest-stat { text-align: center; padding: 15px; background: white; border-radius: 6px; }");
+            html.AppendLine("        .manifest-stat .stat-number { font-size: 36px; }");
+            html.AppendLine("        .manifest-stat.blocker .stat-number { color: #e74c3c; }");
+            html.AppendLine("        .manifest-stat.clean .stat-number { color: #27ae60; }");
+            html.AppendLine("        .manifest-stat.error .stat-number { color: #f39c12; }");
+            html.AppendLine("        .manifest-package { background: white; border: 1px solid #e0e0e0; border-radius: 6px; margin-bottom: 15px; overflow: hidden; }");
+            html.AppendLine("        .manifest-package-header { padding: 15px 20px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }");
+            html.AppendLine("        .manifest-package-header:hover { background: #f8f9fa; }");
+            html.AppendLine("        .manifest-package-header.has-blockers { background: #fff5f5; border-left: 4px solid #e74c3c; }");
+            html.AppendLine("        .manifest-package-header.clean { background: #f0fff4; border-left: 4px solid #27ae60; }");
+            html.AppendLine("        .manifest-package-header.has-error { background: #fffbeb; border-left: 4px solid #f39c12; }");
+            html.AppendLine("        .manifest-package-name { font-weight: 600; font-size: 16px; color: #2c3e50; }");
+            html.AppendLine("        .manifest-package-meta { font-size: 13px; color: #7f8c8d; margin-top: 4px; }");
+            html.AppendLine("        .manifest-package-detail { display: none; padding: 20px; background: #fafafa; border-top: 1px solid #e0e0e0; }");
+            html.AppendLine("        .manifest-dep-table { width: 100%; border-collapse: collapse; margin-top: 10px; }");
+            html.AppendLine("        .manifest-dep-table th { background: #34495e; color: white; padding: 10px 15px; text-align: left; font-size: 13px; }");
+            html.AppendLine("        .manifest-dep-table td { padding: 8px 15px; border-bottom: 1px solid #e0e0e0; font-size: 13px; }");
+            html.AppendLine("        .manifest-dep-table tr:hover { background: #f8f9fa; }");
+            html.AppendLine("        .manifest-dep-table tr.blocker-row { background: #fff5f5; }");
+            html.AppendLine("        .manifest-dep-table tr.blocker-row:hover { background: #ffe8e8; }");
+            html.AppendLine("        .blocker-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }");
+            html.AppendLine("        .blocker-badge.red { background: #fde8e8; color: #c0392b; }");
+            html.AppendLine("        .blocker-badge.green { background: #d4edda; color: #155724; }");
+            html.AppendLine("        .blocker-badge.orange { background: #fff3cd; color: #856404; }");
             html.AppendLine("    </style>");
             html.AppendLine("</head>");
             html.AppendLine("<body>");
@@ -772,6 +1682,197 @@ namespace DotNetCrawler
                 }
 
                 html.AppendLine("            </div>");
+                html.AppendLine("        </div>");
+            }
+
+            // Migration Compatibility Section
+            html.AppendLine("        <div class='migration-section'>");
+            html.AppendLine("            <h2 class='migration-title'>🚀 Migration Compatibility Analysis</h2>");
+            html.AppendLine("            <p class='migration-description'>Analysis of types and their compatibility with .NET Standard 2.0 / .NET Core / .NET 5+</p>");
+
+            var allTypeDetails = results
+                .SelectMany(r => r.PackageUsages)
+                .SelectMany(p => p.TypeDetails.Values)
+                .GroupBy(t => t.Name)
+                .Select(g => g.First())
+                .OrderBy(t => t.IsNetStandardCompatible ? 1 : 0)
+                .ThenBy(t => t.Name);
+
+            var compatibleCount = allTypeDetails.Count(t => t.IsNetStandardCompatible);
+            var blockedCount = allTypeDetails.Count(t => !t.IsNetStandardCompatible);
+
+            html.AppendLine("            <div class='migration-summary'>");
+            html.AppendLine("                <div class='migration-stats'>");
+            html.AppendLine($"                    <div class='migration-stat compatible'>");
+            html.AppendLine($"                        <div class='stat-number'>{compatibleCount}</div>");
+            html.AppendLine($"                        <div class='stat-label'>✅ .NET Standard Compatible</div>");
+            html.AppendLine("                    </div>");
+            html.AppendLine($"                    <div class='migration-stat blocked'>");
+            html.AppendLine($"                        <div class='stat-number'>{blockedCount}</div>");
+            html.AppendLine($"                        <div class='stat-label'>⚠️ Framework Dependencies</div>");
+            html.AppendLine("                    </div>");
+            html.AppendLine("                </div>");
+            html.AppendLine("            </div>");
+
+            // Blocked types
+            var blockedTypes = allTypeDetails.Where(t => !t.IsNetStandardCompatible).ToList();
+            if (blockedTypes.Any())
+            {
+                html.AppendLine("            <div class='migration-group'>");
+                html.AppendLine("                <h3 class='migration-group-title'>⚠️ Types with .NET Framework Dependencies</h3>");
+                html.AppendLine("                <p class='migration-group-desc'>These types use .NET Framework-specific APIs and may require refactoring for migration.</p>");
+
+                foreach (var typeDetail in blockedTypes)
+                {
+                    var migTypeId = $"mig-{typeDetail.Name.Replace("<", "-").Replace(">", "-")}";
+                    html.AppendLine($"                <div class='migration-type'>");
+                    html.AppendLine($"                    <div class='migration-type-header' onclick='toggleMigrationType(\"{migTypeId}\")'>");
+                    html.AppendLine($"                        <div class='migration-type-name'>❌ {typeDetail.Name}</div>");
+                    html.AppendLine($"                        <span class='toggle-icon' id='icon-{migTypeId}'>▶</span>");
+                    html.AppendLine("                    </div>");
+                    html.AppendLine($"                    <div class='migration-type-detail' id='detail-{migTypeId}'>");
+                    html.AppendLine($"                        <div><strong>Namespace:</strong> {typeDetail.Namespace}</div>");
+                    html.AppendLine($"                        <div><strong>Assembly:</strong> {typeDetail.AssemblyName ?? "Unknown"}</div>");
+                    html.AppendLine("                        <div class='dependency-list'>");
+                    html.AppendLine("                            <strong>Framework Dependencies:</strong>");
+                    html.AppendLine("                            <ul>");
+                    foreach (var dep in typeDetail.FrameworkDependencies.Distinct())
+                    {
+                        html.AppendLine($"                                <li>{dep}</li>");
+                    }
+                    html.AppendLine("                            </ul>");
+                    html.AppendLine("                        </div>");
+                    html.AppendLine("                    </div>");
+                    html.AppendLine("                </div>");
+                }
+
+                html.AppendLine("            </div>");
+            }
+
+            // Compatible types
+            var compatibleTypes = allTypeDetails.Where(t => t.IsNetStandardCompatible).ToList();
+            if (compatibleTypes.Any())
+            {
+                html.AppendLine("            <div class='migration-group'>");
+                html.AppendLine("                <h3 class='migration-group-title'>✅ .NET Standard Compatible Types</h3>");
+                html.AppendLine("                <p class='migration-group-desc'>These types don't have detected .NET Framework dependencies and should be easier to migrate.</p>");
+                html.AppendLine("                <div class='compatible-types-grid'>");
+                
+                foreach (var typeDetail in compatibleTypes)
+                {
+                    html.AppendLine($"                    <div class='compatible-type-item'>");
+                    html.AppendLine($"                        <div class='compatible-type-name'>✅ {typeDetail.Name}</div>");
+                    html.AppendLine($"                        <div class='compatible-type-ns'>{typeDetail.Namespace}</div>");
+                    html.AppendLine("                    </div>");
+                }
+                
+                html.AppendLine("                </div>");
+                html.AppendLine("            </div>");
+            }
+
+            html.AppendLine("        </div>");
+
+            // DLL Manifest Analysis Section
+            if (manifestResults != null && manifestResults.Any())
+            {
+                var manifestAnalyzed = manifestResults.Count(r => r.Error == null);
+                var manifestBlockers = manifestResults.Count(r => r.Dependencies.Any(d => d.IsBlocker));
+                var manifestClean = manifestResults.Count(r => r.Error == null && !r.Dependencies.Any(d => d.IsBlocker));
+                var manifestErrors = manifestResults.Count(r => r.Error != null);
+
+                html.AppendLine("        <div class='manifest-section'>");
+                html.AppendLine("            <h2 class='manifest-title'>🔎 DLL Manifest Dependency Analysis</h2>");
+                html.AppendLine("            <p class='manifest-description'>Assembly manifest inspection of matched NuGet package DLLs to detect .NET Framework-only dependencies that block migration to .NET Standard 2.0.</p>");
+
+                html.AppendLine("            <div class='manifest-summary'>");
+                html.AppendLine("                <h3 style='margin-top:0; color: #2c3e50;'>Manifest Analysis Summary</h3>");
+                html.AppendLine("                <div class='manifest-stats'>");
+                html.AppendLine($"                    <div class='manifest-stat blocker'><div class='stat-number'>{manifestBlockers}</div><div class='stat-label'>❌ With Blockers</div></div>");
+                html.AppendLine($"                    <div class='manifest-stat clean'><div class='stat-number'>{manifestClean}</div><div class='stat-label'>✅ Clean</div></div>");
+                html.AppendLine($"                    <div class='manifest-stat error'><div class='stat-number'>{manifestErrors}</div><div class='stat-label'>⚠️ Could Not Analyze</div></div>");
+                html.AppendLine("                </div>");
+                html.AppendLine("            </div>");
+
+                // Packages with blockers first
+                var sortedManifests = manifestResults
+                    .OrderByDescending(r => r.Dependencies.Count(d => d.IsBlocker))
+                    .ThenBy(r => r.PackageName);
+
+                foreach (var manifest in sortedManifests)
+                {
+                    var hasBlockers = manifest.Dependencies.Any(d => d.IsBlocker);
+                    var hasError = manifest.Error != null;
+                    var headerClass = hasBlockers ? "has-blockers" : hasError ? "has-error" : "clean";
+                    var statusIcon = hasBlockers ? "❌" : hasError ? "⚠️" : "✅";
+                    var manifestId = $"manifest-{manifest.PackageName.Replace(".", "-")}";
+
+                    html.AppendLine($"                <div class='manifest-package'>");
+                    html.AppendLine($"                    <div class='manifest-package-header {headerClass}' onclick='toggleManifest(\"{manifestId}\")'>");
+                    html.AppendLine("                        <div>");
+                    html.AppendLine($"                            <div class='manifest-package-name'>{statusIcon} {manifest.PackageName}</div>");
+
+                    if (!string.IsNullOrEmpty(manifest.TargetFramework))
+                    {
+                        html.AppendLine($"                            <div class='manifest-package-meta'>Target Framework: {manifest.TargetFramework}</div>");
+                    }
+
+                    if (hasError)
+                    {
+                        html.AppendLine($"                            <div class='manifest-package-meta'>⚠️ {manifest.Error}</div>");
+                    }
+                    else
+                    {
+                        var blockerDeps = manifest.Dependencies.Count(d => d.IsBlocker);
+                        var totalDeps = manifest.Dependencies.Count;
+                        html.AppendLine($"                            <div class='manifest-package-meta'>{totalDeps} referenced assemblies, {blockerDeps} blocker(s)</div>");
+                    }
+
+                    html.AppendLine("                        </div>");
+                    html.AppendLine($"                        <span class='toggle-icon' id='icon-{manifestId}'>▶</span>");
+                    html.AppendLine("                    </div>");
+                    html.AppendLine($"                    <div class='manifest-package-detail' id='detail-{manifestId}'>");
+
+                    if (manifest.Dependencies.Any())
+                    {
+                        if (!string.IsNullOrEmpty(manifest.DllPath))
+                        {
+                            html.AppendLine($"                        <div style='margin-bottom: 15px; font-size: 13px; color: #7f8c8d;'><strong>DLL Path:</strong> {manifest.DllPath}</div>");
+                        }
+                        if (!string.IsNullOrEmpty(manifest.AssemblyFullName))
+                        {
+                            html.AppendLine($"                        <div style='margin-bottom: 15px; font-size: 13px; color: #7f8c8d;'><strong>Assembly:</strong> {manifest.AssemblyFullName}</div>");
+                        }
+
+                        html.AppendLine("                        <table class='manifest-dep-table'>");
+                        html.AppendLine("                            <thead><tr><th>Referenced Assembly</th><th>Version</th><th>Status</th><th>Details</th></tr></thead>");
+                        html.AppendLine("                            <tbody>");
+
+                        foreach (var dep in manifest.Dependencies.OrderByDescending(d => d.IsBlocker).ThenBy(d => d.AssemblyName))
+                        {
+                            var rowClass = dep.IsBlocker ? " class='blocker-row'" : "";
+                            var statusBadge = dep.IsBlocker
+                                ? $"<span class='blocker-badge red'>❌ BLOCKER</span>"
+                                : "<span class='blocker-badge green'>✅ OK</span>";
+                            var details = dep.IsBlocker
+                                ? $"<strong>{dep.BlockerCategory}:</strong> {dep.BlockerReason}"
+                                : "";
+
+                            html.AppendLine($"                                <tr{rowClass}>");
+                            html.AppendLine($"                                    <td><code>{dep.AssemblyName}</code></td>");
+                            html.AppendLine($"                                    <td>{dep.Version}</td>");
+                            html.AppendLine($"                                    <td>{statusBadge}</td>");
+                            html.AppendLine($"                                    <td>{details}</td>");
+                            html.AppendLine("                                </tr>");
+                        }
+
+                        html.AppendLine("                            </tbody>");
+                        html.AppendLine("                        </table>");
+                    }
+
+                    html.AppendLine("                    </div>");
+                    html.AppendLine("                </div>");
+                }
+
                 html.AppendLine("        </div>");
             }
 
@@ -887,6 +1988,28 @@ namespace DotNetCrawler
             html.AppendLine("                    item.style.display = 'none';");
             html.AppendLine("                }");
             html.AppendLine("            });");
+            html.AppendLine("        }");
+            html.AppendLine("        function toggleMigrationType(typeId) {");
+            html.AppendLine("            var detail = document.getElementById('detail-' + typeId);");
+            html.AppendLine("            var icon = document.getElementById('icon-' + typeId);");
+            html.AppendLine("            if (detail.style.display === 'none' || !detail.style.display) {");
+            html.AppendLine("                detail.style.display = 'block';");
+            html.AppendLine("                icon.classList.add('open');");
+            html.AppendLine("            } else {");
+            html.AppendLine("                detail.style.display = 'none';");
+            html.AppendLine("                icon.classList.remove('open');");
+            html.AppendLine("            }");
+            html.AppendLine("        }");
+            html.AppendLine("        function toggleManifest(manifestId) {");
+            html.AppendLine("            var detail = document.getElementById('detail-' + manifestId);");
+            html.AppendLine("            var icon = document.getElementById('icon-' + manifestId);");
+            html.AppendLine("            if (detail.style.display === 'none' || !detail.style.display) {");
+            html.AppendLine("                detail.style.display = 'block';");
+            html.AppendLine("                icon.classList.add('open');");
+            html.AppendLine("            } else {");
+            html.AppendLine("                detail.style.display = 'none';");
+            html.AppendLine("                icon.classList.remove('open');");
+            html.AppendLine("            }");
             html.AppendLine("        }");
             html.AppendLine("    </script>");
             html.AppendLine("</body>");
@@ -1044,6 +2167,9 @@ namespace DotNetCrawler
             public Dictionary<string, HashSet<string>> TypesByNamespace { get; set; } // Namespace -> Types
             public HashSet<string> UsedTypes { get; set; } // All types combined (for backward compatibility)
             public HashSet<string> Files { get; set; }
+            public Dictionary<string, TypeDetail> TypeDetails { get; set; } // Type name -> details with dependencies
+            public string PackageTargetFramework { get; set; }
+            public List<AssemblyDependency> PackageAssemblyDependencies { get; set; }
 
             public PackageUsageDetail()
             {
@@ -1051,6 +2177,23 @@ namespace DotNetCrawler
                 TypesByNamespace = new Dictionary<string, HashSet<string>>();
                 UsedTypes = new HashSet<string>();
                 Files = new HashSet<string>();
+                TypeDetails = new Dictionary<string, TypeDetail>();
+                PackageAssemblyDependencies = new List<AssemblyDependency>();
+            }
+        }
+
+        class TypeDetail
+        {
+            public string Name { get; set; }
+            public string Namespace { get; set; }
+            public string AssemblyName { get; set; }
+            public List<string> FrameworkDependencies { get; set; }
+            public bool IsNetStandardCompatible { get; set; }
+
+            public TypeDetail()
+            {
+                FrameworkDependencies = new List<string>();
+                IsNetStandardCompatible = true;
             }
         }
 
@@ -1061,6 +2204,50 @@ namespace DotNetCrawler
             public string PackageName { get; set; }
             public string ProjectName { get; set; }
             public List<string> Files { get; set; }
+        }
+
+        class AssemblyAnalysisInfo
+        {
+            public string PackageName { get; set; }
+            public string TargetFramework { get; set; }
+            public List<AssemblyDependency> Dependencies { get; set; }
+
+            public AssemblyAnalysisInfo()
+            {
+                Dependencies = new List<AssemblyDependency>();
+            }
+        }
+
+        class AssemblyDependency
+        {
+            public string Name { get; set; }
+            public string Version { get; set; }
+            public bool IsFrameworkOnly { get; set; }
+            public string FrameworkOnlyReason { get; set; }
+        }
+
+        class DllManifestAnalysis
+        {
+            public string PackageName { get; set; }
+            public string DllPath { get; set; }
+            public string AssemblyFullName { get; set; }
+            public string TargetFramework { get; set; }
+            public string Error { get; set; }
+            public List<ManifestDependencyInfo> Dependencies { get; set; }
+
+            public DllManifestAnalysis()
+            {
+                Dependencies = new List<ManifestDependencyInfo>();
+            }
+        }
+
+        class ManifestDependencyInfo
+        {
+            public string AssemblyName { get; set; }
+            public string Version { get; set; }
+            public bool IsBlocker { get; set; }
+            public string BlockerReason { get; set; }
+            public string BlockerCategory { get; set; }
         }
     }
 }
