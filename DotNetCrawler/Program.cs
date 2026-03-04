@@ -262,18 +262,46 @@ namespace DotNetCrawler
                         var usingDirectives = root.DescendantNodes()
                             .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax>()
                             .Select(u => u.Name.ToString())
-                            .ToList();
+                            .ToHashSet();
+
+                        // Get all type identifiers used in the file
+                        var typeIdentifiers = root.DescendantNodes()
+                            .OfType<IdentifierNameSyntax>()
+                            .Select(i => i.Identifier.Text)
+                            .Where(t => !string.IsNullOrWhiteSpace(t) && char.IsUpper(t[0])) // Types typically start with uppercase
+                            .ToHashSet();
+
+                        // Also get generic names
+                        var genericNames = root.DescendantNodes()
+                            .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.GenericNameSyntax>()
+                            .Select(g => g.Identifier.Text)
+                            .Where(t => !string.IsNullOrWhiteSpace(t))
+                            .ToHashSet();
+
+                        typeIdentifiers.UnionWith(genericNames);
 
                         // Check if any package namespaces are used
                         foreach (var packageUsage in projectResult.PackageUsages)
                         {
-                            foreach (var usingDir in usingDirectives)
+                            var packageNamespacesInFile = usingDirectives
+                                .Where(u => u.StartsWith(packageUsage.PackageName, StringComparison.OrdinalIgnoreCase))
+                                .ToList();
+
+                            if (packageNamespacesInFile.Any())
                             {
-                                if (usingDir.StartsWith(packageUsage.PackageName, StringComparison.OrdinalIgnoreCase))
+                                // Add namespaces
+                                foreach (var ns in packageNamespacesInFile)
                                 {
-                                    packageUsage.UsedNamespaces.Add(usingDir);
-                                    packageUsage.Files.Add(Path.GetFileName(csFile));
+                                    packageUsage.UsedNamespaces.Add(ns);
                                 }
+
+                                // Add types used in this file (best effort - these are likely from the package)
+                                foreach (var type in typeIdentifiers)
+                                {
+                                    packageUsage.UsedTypes.Add(type);
+                                }
+
+                                packageUsage.Files.Add(Path.GetFileName(csFile));
                             }
                         }
                     }
@@ -306,6 +334,7 @@ namespace DotNetCrawler
                 {
                     Console.WriteLine($"\n  📦 {packageUsage.PackageName} (v{packageUsage.Version})");
                     Console.WriteLine($"     Namespaces: {packageUsage.UsedNamespaces.Count}");
+                    Console.WriteLine($"     Types: {packageUsage.UsedTypes.Count}");
                     Console.WriteLine($"     Files: {packageUsage.Files.Count}");
 
                     if (packageUsage.UsedNamespaces.Any())
@@ -318,6 +347,19 @@ namespace DotNetCrawler
                         if (packageUsage.UsedNamespaces.Count > 3)
                         {
                             Console.WriteLine($"        ... and {packageUsage.UsedNamespaces.Count - 3} more");
+                        }
+
+                        if (packageUsage.UsedTypes.Any())
+                        {
+                            Console.WriteLine($"     Top Types Used:");
+                            foreach (var type in packageUsage.UsedTypes.OrderBy(t => t).Take(5))
+                            {
+                                Console.WriteLine($"        - {type}");
+                            }
+                            if (packageUsage.UsedTypes.Count > 5)
+                            {
+                                Console.WriteLine($"        ... and {packageUsage.UsedTypes.Count - 5} more");
+                            }
                         }
                     }
                     else
@@ -363,6 +405,9 @@ namespace DotNetCrawler
             html.AppendLine("        .package-detail.show { display: block; }");
             html.AppendLine("        .namespace-list { list-style: none; padding: 0; margin: 10px 0; }");
             html.AppendLine("        .namespace-item { padding: 8px 12px; background: white; margin: 5px 0; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 13px; color: #27ae60; border-left: 3px solid #27ae60; }");
+            html.AppendLine("        .type-list { list-style: none; padding: 0; margin: 10px 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 5px; }");
+            html.AppendLine("        .type-item { padding: 6px 10px; background: #e3f2fd; margin: 0; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 12px; color: #1976d2; border-left: 3px solid #1976d2; }");
+            html.AppendLine("        .section-header { font-weight: 600; color: #2c3e50; margin-top: 15px; margin-bottom: 10px; font-size: 14px; }");
             html.AppendLine("        .file-list { margin-top: 15px; }");
             html.AppendLine("        .file-item { display: inline-block; padding: 4px 10px; background: #ecf0f1; margin: 3px; border-radius: 3px; font-size: 12px; color: #34495e; }");
             html.AppendLine("        .warning { background: #fff3cd; border-left-color: #ffc107; padding: 15px; color: #856404; font-weight: 500; }");
@@ -385,6 +430,7 @@ namespace DotNetCrawler
             var totalProjects = results.Count;
             var totalPackages = results.SelectMany(r => r.PackageUsages).Select(p => p.PackageName).Distinct().Count();
             var totalNamespaces = results.SelectMany(r => r.PackageUsages).SelectMany(p => p.UsedNamespaces).Distinct().Count();
+            var totalTypes = results.SelectMany(r => r.PackageUsages).SelectMany(p => p.UsedTypes).Distinct().Count();
             var unusedPackages = results.SelectMany(r => r.PackageUsages).Count(p => !p.UsedNamespaces.Any());
 
             html.AppendLine("        <div class='summary'>");
@@ -393,6 +439,7 @@ namespace DotNetCrawler
             html.AppendLine($"                <div class='summary-item'><div class='summary-number'>{totalProjects}</div><div class='summary-label'>Projects</div></div>");
             html.AppendLine($"                <div class='summary-item'><div class='summary-number'>{totalPackages}</div><div class='summary-label'>Unique Packages</div></div>");
             html.AppendLine($"                <div class='summary-item'><div class='summary-number'>{totalNamespaces}</div><div class='summary-label'>Namespaces Used</div></div>");
+            html.AppendLine($"                <div class='summary-item'><div class='summary-number'>{totalTypes}</div><div class='summary-label'>Types Used</div></div>");
             html.AppendLine($"                <div class='summary-item'><div class='summary-number'>{unusedPackages}</div><div class='summary-label'>Unused Packages</div></div>");
             html.AppendLine("            </div>");
             html.AppendLine("        </div>");
@@ -426,6 +473,7 @@ namespace DotNetCrawler
                     html.AppendLine("                        </div>");
                     html.AppendLine("                        <div class='package-stats'>");
                     html.AppendLine($"                            <span>{package.UsedNamespaces.Count} namespace(s)</span>");
+                    html.AppendLine($"                            <span>{package.UsedTypes.Count} type(s)</span>");
                     html.AppendLine($"                            <span>{package.Files.Count} file(s)</span>");
                     html.AppendLine($"                            <span class='toggle-icon' id='icon-{packageId}'>▶</span>");
                     html.AppendLine("                        </div>");
@@ -438,7 +486,7 @@ namespace DotNetCrawler
                     }
                     else
                     {
-                        html.AppendLine("                        <h4>Used Namespaces:</h4>");
+                        html.AppendLine("                        <div class='section-header'>📋 Used Namespaces:</div>");
                         html.AppendLine("                        <ul class='namespace-list'>");
                         foreach (var ns in package.UsedNamespaces.OrderBy(n => n))
                         {
@@ -446,10 +494,21 @@ namespace DotNetCrawler
                         }
                         html.AppendLine("                        </ul>");
 
+                        if (package.UsedTypes.Any())
+                        {
+                            html.AppendLine("                        <div class='section-header'>🔷 Types Used:</div>");
+                            html.AppendLine("                        <ul class='type-list'>");
+                            foreach (var type in package.UsedTypes.OrderBy(t => t))
+                            {
+                                html.AppendLine($"                            <li class='type-item'>{type}</li>");
+                            }
+                            html.AppendLine("                        </ul>");
+                        }
+
                         if (package.Files.Any())
                         {
                             html.AppendLine("                        <div class='file-list'>");
-                            html.AppendLine("                            <strong>Files:</strong><br>");
+                            html.AppendLine("                            <div class='section-header'>📄 Files:</div>");
                             foreach (var file in package.Files.OrderBy(f => f))
                             {
                                 html.AppendLine($"                            <span class='file-item'>{file}</span>");
@@ -588,11 +647,13 @@ namespace DotNetCrawler
             public string PackageName { get; set; }
             public string Version { get; set; }
             public HashSet<string> UsedNamespaces { get; set; }
+            public HashSet<string> UsedTypes { get; set; }
             public HashSet<string> Files { get; set; }
 
             public PackageUsageDetail()
             {
                 UsedNamespaces = new HashSet<string>();
+                UsedTypes = new HashSet<string>();
                 Files = new HashSet<string>();
             }
         }

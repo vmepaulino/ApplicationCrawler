@@ -53,10 +53,11 @@ DotNetCrawler.exe -s MySolution.sln -d "MyCompany.*" -o "usage-report.html"
 
 The generated HTML report includes:
 
-- ?? **Summary Dashboard** - Overview of projects, packages, and usage statistics
+- ?? **Summary Dashboard** - Overview of projects, packages, types, and usage statistics
 - ?? **Project Breakdown** - Each project with its referenced packages
 - ?? **Package Details** - Version information and usage metrics
 - ?? **Namespace Tracking** - Exact namespaces used from each package
+- ?? **Type Tracking** - Specific types/classes used from each package
 - ?? **File References** - List of files that use each package
 - ?? **Unused Package Warnings** - Highlights packages that aren't actually used
 - ?? **Interactive UI** - Expandable/collapsible sections for easy navigation
@@ -88,10 +89,18 @@ Found 1 matching packages:
 
   ?? Newtonsoft.Json (v13.0.1)
      Namespaces: 2
+     Types: 15
      Files: 5
      Top Namespaces:
         - Newtonsoft.Json
         - Newtonsoft.Json.Linq
+     Top Types Used:
+        - JsonConvert
+        - JObject
+        - JArray
+        - JsonSerializer
+        - JsonProperty
+        ... and 10 more
 
 ?? HTML report generated: C:\Projects\usage-report.html
 
