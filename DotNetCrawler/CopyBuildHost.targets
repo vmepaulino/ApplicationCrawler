@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Target Name="CopyBuildHostFiles" AfterTargets="Build">
+    <PropertyGroup>
+      <BuildHostSourcePath>$(MSBuildThisFileDirectory)..\packages\Microsoft.CodeAnalysis.Workspaces.MSBuild.4.0.1\tools\BuildHost-net472</BuildHostSourcePath>
+      <BuildHostTargetPath>$(OutDir)BuildHost-net472</BuildHostTargetPath>
+    </PropertyGroup>
+    
+    <Message Text="Copying BuildHost files from $(BuildHostSourcePath) to $(BuildHostTargetPath)" Importance="high" />
+    
+    <ItemGroup>
+      <BuildHostFiles Include="$(BuildHostSourcePath)\**\*.*" />
+    </ItemGroup>
+    
+    <MakeDir Directories="$(BuildHostTargetPath)" Condition="!Exists('$(BuildHostTargetPath)')" />
+    
+    <Copy SourceFiles="@(BuildHostFiles)" 
+          DestinationFolder="$(BuildHostTargetPath)\%(RecursiveDir)" 
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(BuildHostSourcePath)')" />
+  </Target>
+</Project>
