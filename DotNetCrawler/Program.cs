@@ -361,17 +361,63 @@ namespace DotNetCrawler
             };
         }
 
+        static bool LooksLikeMethod(string identifier)
+        {
+            // Check if it contains parentheses (method call indicators)
+            if (identifier.Contains("(") || identifier.Contains(")"))
+                return true;
+            
+            // Check if it contains common parameter indicators
+            if (identifier.Contains(":") || identifier.Contains(","))
+                return true;
+            
+            // Common method verb prefixes
+            var methodVerbs = new[] { "Get", "Set", "Add", "Remove", "Delete", "Create", "Update", 
+                                     "Find", "Load", "Save", "Insert", "Execute", "Run", "Start",
+                                     "Stop", "Parse", "Calculate", "Compute", "Process", "Handle",
+                                     "Validate", "Check", "Is", "Has", "Can", "Should", "Build",
+                                     "Generate", "Retrieve", "Fetch", "Query", "Search", "Filter" };
+            
+            // If identifier is very short (1-2 chars) and starts with verb, likely a method
+            foreach (var verb in methodVerbs)
+            {
+                if (identifier == verb || 
+                    (identifier.StartsWith(verb) && identifier.Length > verb.Length && 
+                     char.IsUpper(identifier[verb.Length])))
+                {
+                    // Additional check: if it ends with common suffixes that indicate methods
+                    var methodSuffixes = new[] { "Async", "All", "ById", "ByName", "List", "Collection",
+                                                 "Result", "Results", "Data", "Info" };
+                    
+                    foreach (var suffix in methodSuffixes)
+                    {
+                        if (identifier.EndsWith(suffix))
+                            return true;
+                    }
+                    
+                    // If it's just the verb or verb + one more word, more likely to be a method
+                    // unless it's something like "GetType" which is actually a method but commonly used
+                    if (identifier.Length <= verb.Length + 10) // Short names are more likely methods
+                    {
+                        return true;
+                    }
+                }
+            }
+            
+            return false;
+        }
+
         static void FilterCommonTypes(PackageUsageDetail packageUsage)
         {
             var commonTypes = GetCommonSystemTypes();
             
-            // Filter UsedTypes
-            packageUsage.UsedTypes.RemoveWhere(t => commonTypes.Contains(t));
+            // Filter UsedTypes - remove system types and things that look like methods
+            packageUsage.UsedTypes.RemoveWhere(t => commonTypes.Contains(t) || LooksLikeMethod(t));
             
             // Filter TypesByNamespace
             foreach (var ns in packageUsage.TypesByNamespace.Keys.ToList())
             {
-                packageUsage.TypesByNamespace[ns].RemoveWhere(t => commonTypes.Contains(t));
+                packageUsage.TypesByNamespace[ns].RemoveWhere(t => commonTypes.Contains(t) || LooksLikeMethod(t));
             }
         }
 
