@@ -1080,10 +1080,11 @@ internal class Program
 
         try
         {
+            var isWindows = OperatingSystem.IsWindows();
             var psi = new ProcessStartInfo
             {
-                FileName = "npm",
-                Arguments = "outdated --json",
+                FileName = isWindows ? "cmd.exe" : "npm",
+                Arguments = isWindows ? "/c npm outdated --json" : "outdated --json",
                 WorkingDirectory = appPath,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
