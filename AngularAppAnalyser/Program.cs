@@ -42,6 +42,7 @@ internal class Program
             [
                 new ConsoleReportWriter(),
                 new HtmlReportWriter(),
+                new JsonReportWriter(),
             ];
 
             var engine = new AnalysisEngine(steps, writers);
