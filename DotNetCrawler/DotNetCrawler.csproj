@@ -234,8 +234,15 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Analyzers\CodeUsageAnalyzer.cs" />
+    <Compile Include="Analyzers\DllManifestAnalyzer.cs" />
+    <Compile Include="Analyzers\FrameworkCompatibility.cs" />
+    <Compile Include="Analyzers\SolutionParser.cs" />
+    <Compile Include="Models\DataModels.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="Reporting\ConsoleReportWriter.cs" />
+    <Compile Include="Reporting\HtmlReportWriter.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="App.config" />
