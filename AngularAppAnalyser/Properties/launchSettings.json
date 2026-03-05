@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "AngularAppAnalyser": {
+      "commandName": "Project",
+      "commandLineArgs": "-p C:\\work\\projects\\totalsds\\Authoring\\repo\\SDS-Application\\src\\SDS.WebSite -o ang-report.html"
+    }
+  }
+}

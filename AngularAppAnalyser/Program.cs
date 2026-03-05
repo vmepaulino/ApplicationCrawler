@@ -58,46 +58,63 @@ internal class Program
         var report = new AnalysisReport { AppPath = appPath, Timestamp = DateTime.Now };
 
         // Step 1: Parse project metadata
-        Console.WriteLine("[Step 1/6] 📦 Parsing project metadata...");
+        Console.WriteLine("[Step 1/8] 📦 Parsing project metadata...");
         report.ProjectMetadata = AnalyzeProjectMetadata(appPath);
-        Console.WriteLine($"[Step 1/6] ✅ Angular v{report.ProjectMetadata.AngularVersion ?? "unknown"}, {report.ProjectMetadata.Dependencies.Count} deps, {report.ProjectMetadata.DevDependencies.Count} devDeps ({stopwatch.ElapsedMilliseconds}ms)");
+        Console.WriteLine($"[Step 1/8] ✅ Angular v{report.ProjectMetadata.AngularVersion ?? "unknown"}, {report.ProjectMetadata.Dependencies.Count} deps, {report.ProjectMetadata.DevDependencies.Count} devDeps ({stopwatch.ElapsedMilliseconds}ms)");
         Console.WriteLine();
 
         // Step 2: Scan for security vulnerabilities
-        Console.WriteLine("[Step 2/6] 🛡️ Scanning for security vulnerabilities...");
+        Console.WriteLine("[Step 2/8] 🛡️ Scanning for security vulnerabilities...");
         var stepStart = stopwatch.ElapsedMilliseconds;
         report.SecurityFindings = AnalyzeSecurity(appPath);
         var criticalCount = report.SecurityFindings.Count(f => f.Severity == Severity.Critical);
         var highCount = report.SecurityFindings.Count(f => f.Severity == Severity.High);
-        Console.WriteLine($"[Step 2/6] ✅ {report.SecurityFindings.Count} finding(s) — {criticalCount} critical, {highCount} high ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
+        Console.WriteLine($"[Step 2/8] ✅ {report.SecurityFindings.Count} finding(s) — {criticalCount} critical, {highCount} high ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
         Console.WriteLine();
 
         // Step 3: Analyze storage usage
-        Console.WriteLine("[Step 3/6] 💾 Analyzing storage usage...");
+        Console.WriteLine("[Step 3/8] 💾 Analyzing storage usage...");
         stepStart = stopwatch.ElapsedMilliseconds;
         report.StorageFindings = AnalyzeStorage(appPath);
-        Console.WriteLine($"[Step 3/6] ✅ {report.StorageFindings.Count} storage usage(s) found ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
+        Console.WriteLine($"[Step 3/8] ✅ {report.StorageFindings.Count} storage usage(s) found ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
         Console.WriteLine();
 
-        // Step 4: Analyze API communication
-        Console.WriteLine("[Step 4/6] 🌐 Analyzing API communication patterns...");
+        // Step 4: Analyze API communication + extract endpoints
+        Console.WriteLine("[Step 4/8] 🌐 Analyzing API communication & extracting endpoints...");
         stepStart = stopwatch.ElapsedMilliseconds;
         report.ApiFindings = AnalyzeApiCommunication(appPath);
-        Console.WriteLine($"[Step 4/6] ✅ {report.ApiFindings.Count} finding(s) ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
+        report.ApiEndpoints = ExtractApiEndpoints(appPath);
+        Console.WriteLine($"[Step 4/8] ✅ {report.ApiFindings.Count} finding(s), {report.ApiEndpoints.Count} API endpoint(s) discovered ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
         Console.WriteLine();
 
-        // Step 5: Analyze application design
-        Console.WriteLine("[Step 5/6] 🏗️ Analyzing application design...");
+        // Step 5: Analyze application design + browser resources
+        Console.WriteLine("[Step 5/8] 🏗️ Analyzing application design & browser resources...");
         stepStart = stopwatch.ElapsedMilliseconds;
         report.DesignFindings = AnalyzeDesign(appPath);
-        Console.WriteLine($"[Step 5/6] ✅ {report.DesignFindings.Count} finding(s) ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
+        Console.WriteLine($"[Step 5/8] ✅ {report.DesignFindings.Count} finding(s) ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
         Console.WriteLine();
 
         // Step 6: Analyze library health
-        Console.WriteLine("[Step 6/6] 📚 Analyzing library health...");
+        Console.WriteLine("[Step 6/8] 📚 Analyzing library health...");
         stepStart = stopwatch.ElapsedMilliseconds;
         report.LibraryFindings = AnalyzeLibraries(report.ProjectMetadata);
-        Console.WriteLine($"[Step 6/6] ✅ {report.LibraryFindings.Count} finding(s) ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
+        Console.WriteLine($"[Step 6/8] ✅ {report.LibraryFindings.Count} finding(s) ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
+        Console.WriteLine();
+
+        // Step 7: Check library versions via npm outdated
+        Console.WriteLine("[Step 7/8] 🔄 Checking library versions (npm outdated)...");
+        stepStart = stopwatch.ElapsedMilliseconds;
+        report.LibraryVersions = CheckLibraryVersions(appPath);
+        var outdatedMajor = report.LibraryVersions.Count(v => v.UpdateType == "major");
+        Console.WriteLine($"[Step 7/8] ✅ {report.LibraryVersions.Count} outdated package(s), {outdatedMajor} major update(s) ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
+        Console.WriteLine();
+
+        // Step 8: Build security posture
+        Console.WriteLine("[Step 8/8] 🔐 Building security posture summary...");
+        stepStart = stopwatch.ElapsedMilliseconds;
+        report.SecurityPosture = BuildSecurityPosture(appPath, report);
+        var inPlaceCount = report.SecurityPosture.Count(p => p.InPlace);
+        Console.WriteLine($"[Step 8/8] ✅ {inPlaceCount}/{report.SecurityPosture.Count} security controls in place ({stopwatch.ElapsedMilliseconds - stepStart}ms)");
         Console.WriteLine();
 
         // Console summary
@@ -785,6 +802,55 @@ internal class Program
             });
         }
 
+        // Browser resource usage patterns
+        var browserResourcePatterns = new List<SecurityPattern>
+        {
+            new(@"setTimeout\s*\(", "setTimeout usage", "setTimeout detected. Ensure timers are cleared in ngOnDestroy to prevent memory leaks. Consider RxJS timer() instead.", Severity.Medium, "Application Design"),
+            new(@"setInterval\s*\(", "setInterval usage", "setInterval detected. Intervals MUST be cleared in ngOnDestroy. Prefer RxJS interval() with takeUntil for automatic cleanup.", Severity.High, "Application Design"),
+            new(@"(?<!remove)addEventListener\s*\(", "Manual event listener", "Manual addEventListener bypasses Angular zone and won't auto-clean. Use @HostListener or Renderer2, and remove in ngOnDestroy.", Severity.Medium, "Application Design"),
+            new(@"new\s+WebSocket\s*\(", "WebSocket connection", "Raw WebSocket usage. Consider RxJS webSocket() for automatic reconnection and cleanup, or a library like socket.io-client.", Severity.Medium, "Application Design"),
+            new(@"new\s+(MutationObserver|ResizeObserver|IntersectionObserver)", "DOM Observer", "DOM Observer detected. Call disconnect() in ngOnDestroy to prevent memory leaks.", Severity.Medium, "Application Design"),
+            new(@"document\.(getElementById|querySelector|querySelectorAll|getElementsBy)", "Direct DOM query", "Direct DOM access bypasses Angular rendering. Use @ViewChild, Renderer2, or Angular directives. Breaks SSR.", Severity.High, "Application Design"),
+            new(@"\.nativeElement", "nativeElement access", "Direct nativeElement access breaks Angular abstraction and server-side rendering. Use Renderer2 for DOM manipulation.", Severity.Medium, "Application Design"),
+            new(@"window\.location\s*=|window\.location\.href\s*=", "window.location navigation", "Direct window.location navigation bypasses Angular Router lifecycle hooks. Use Router.navigate().", Severity.Medium, "Application Design"),
+            new(@"new\s+Worker\s*\(", "Web Worker", "Web Worker detected. Good for offloading heavy computation from the main thread.", Severity.Info, "Application Design"),
+            new(@"navigator\.(geolocation|mediaDevices|bluetooth|usb|serial)", "Browser hardware API", "Browser hardware/sensor API access. Handle permission denial gracefully and check API availability.", Severity.Low, "Application Design"),
+            new(@"requestAnimationFrame\s*\(", "requestAnimationFrame", "requestAnimationFrame detected. Cancel with cancelAnimationFrame in ngOnDestroy to prevent leaks.", Severity.Medium, "Application Design"),
+        };
+
+        foreach (var file in tsFiles)
+        {
+            try
+            {
+                var content = File.ReadAllText(file);
+                var relativePath = Path.GetRelativePath(appPath, file);
+                var lines = content.Split('\n');
+
+                foreach (var pattern in browserResourcePatterns)
+                {
+                    var matches = Regex.Matches(content, pattern.Pattern, RegexOptions.IgnoreCase);
+                    foreach (Match match in matches)
+                    {
+                        var lineNumber = content[..match.Index].Count(c => c == '\n') + 1;
+                        var lineContent = lineNumber <= lines.Length ? lines[lineNumber - 1].Trim() : "";
+                        if (lineContent.TrimStart().StartsWith("//") || lineContent.TrimStart().StartsWith("*"))
+                            continue;
+                        findings.Add(new Finding
+                        {
+                            Title = pattern.Title,
+                            Description = pattern.Description,
+                            Severity = pattern.Severity,
+                            Category = pattern.Category,
+                            File = relativePath,
+                            Line = lineNumber,
+                            CodeSnippet = lineContent.Length > 120 ? lineContent[..120] + "..." : lineContent
+                        });
+                    }
+                }
+            }
+            catch { }
+        }
+
         // Check for unit test files
         var specFiles = GetSourceFiles(appPath, "*.spec.ts");
         if (specFiles.Count == 0)
@@ -942,6 +1008,220 @@ internal class Program
     }
 
     // ───────────────────────────────────────────────────────────
+    // API Endpoint Extraction
+    // ───────────────────────────────────────────────────────────
+
+    static List<ApiEndpointInfo> ExtractApiEndpoints(string appPath)
+    {
+        var endpoints = new List<ApiEndpointInfo>();
+        var tsFiles = GetSourceFiles(appPath, "*.ts");
+
+        var httpCallPattern = @"this\.\w+\.(get|post|put|delete|patch|head|options)\s*(?:<[^>]*>)?\s*\(\s*([`'""])(.*?)\2";
+
+        foreach (var file in tsFiles)
+        {
+            try
+            {
+                var content = File.ReadAllText(file);
+                var relativePath = Path.GetRelativePath(appPath, file);
+                var lines = content.Split('\n');
+
+                var serviceMatch = Regex.Match(content, @"export\s+class\s+(\w+)");
+                var serviceName = serviceMatch.Success ? serviceMatch.Groups[1].Value : Path.GetFileNameWithoutExtension(file);
+
+                var matches = Regex.Matches(content, httpCallPattern, RegexOptions.Singleline);
+                foreach (Match match in matches)
+                {
+                    var lineNumber = content[..match.Index].Count(c => c == '\n') + 1;
+                    var lineContent = lineNumber <= lines.Length ? lines[lineNumber - 1].Trim() : "";
+                    if (lineContent.TrimStart().StartsWith("//")) continue;
+
+                    endpoints.Add(new ApiEndpointInfo
+                    {
+                        HttpMethod = match.Groups[1].Value.ToUpper(),
+                        Url = match.Groups[3].Value,
+                        File = relativePath,
+                        Line = lineNumber,
+                        ServiceName = serviceName
+                    });
+                }
+
+                // Also check for fetch() calls
+                var fetchMatches = Regex.Matches(content, @"fetch\s*\(\s*([`'""])(.*?)\1", RegexOptions.Singleline);
+                foreach (Match match in fetchMatches)
+                {
+                    var lineNumber = content[..match.Index].Count(c => c == '\n') + 1;
+                    var lineContent = lineNumber <= lines.Length ? lines[lineNumber - 1].Trim() : "";
+                    if (lineContent.TrimStart().StartsWith("//")) continue;
+
+                    endpoints.Add(new ApiEndpointInfo
+                    {
+                        HttpMethod = "FETCH",
+                        Url = match.Groups[2].Value,
+                        File = relativePath,
+                        Line = lineNumber,
+                        ServiceName = serviceName
+                    });
+                }
+            }
+            catch { }
+        }
+
+        return endpoints;
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Library Version Checking (npm outdated)
+    // ───────────────────────────────────────────────────────────
+
+    static List<LibraryVersionInfo> CheckLibraryVersions(string appPath)
+    {
+        var versions = new List<LibraryVersionInfo>();
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "npm",
+                Arguments = "outdated --json",
+                WorkingDirectory = appPath,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(psi);
+            if (process is null)
+            {
+                Console.WriteLine("   \u26a0\ufe0f  npm not found. Skipping version check.");
+                return versions;
+            }
+
+            var output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit(30_000);
+
+            if (!string.IsNullOrWhiteSpace(output))
+            {
+                using var doc = JsonDocument.Parse(output);
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    var info = new LibraryVersionInfo { Name = prop.Name };
+
+                    if (prop.Value.TryGetProperty("current", out var current))
+                        info.Current = current.GetString() ?? "";
+                    if (prop.Value.TryGetProperty("wanted", out var wanted))
+                        info.Wanted = wanted.GetString() ?? "";
+                    if (prop.Value.TryGetProperty("latest", out var latest))
+                        info.Latest = latest.GetString() ?? "";
+
+                    info.UpdateType = DetermineUpdateType(info.Current, info.Latest);
+                    versions.Add(info);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"   \u26a0\ufe0f  Could not run npm outdated: {ex.Message}");
+        }
+
+        return versions;
+    }
+
+    static string DetermineUpdateType(string current, string latest)
+    {
+        if (string.IsNullOrEmpty(current) || string.IsNullOrEmpty(latest)) return "unknown";
+
+        var curParts = current.TrimStart('^', '~').Split('.');
+        var latParts = latest.TrimStart('^', '~').Split('.');
+
+        if (curParts.Length > 0 && latParts.Length > 0 && curParts[0] != latParts[0])
+            return "major";
+        if (curParts.Length > 1 && latParts.Length > 1 && curParts[1] != latParts[1])
+            return "minor";
+        if (curParts.Length > 2 && latParts.Length > 2 && curParts[2] != latParts[2])
+            return "patch";
+
+        return "current";
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Security Posture Analysis
+    // ───────────────────────────────────────────────────────────
+
+    static List<SecurityPostureItem> BuildSecurityPosture(string appPath, AnalysisReport report)
+    {
+        var posture = new List<SecurityPostureItem>();
+        var tsFiles = GetSourceFiles(appPath, "*.ts");
+
+        bool FileContains(string pattern) =>
+            tsFiles.Any(f => { try { return Regex.IsMatch(File.ReadAllText(f), pattern, RegexOptions.IgnoreCase); } catch { return false; } });
+
+        bool FileContainsBoth(string p1, string p2) =>
+            tsFiles.Any(f => { try { var c = File.ReadAllText(f); return Regex.IsMatch(c, p1, RegexOptions.IgnoreCase) && Regex.IsMatch(c, p2, RegexOptions.IgnoreCase); } catch { return false; } });
+
+        // Authentication
+        var hasAuthGuard = FileContains(@"canActivate|CanActivateFn|canMatch|CanMatchFn");
+        posture.Add(new SecurityPostureItem { Area = "Authentication", Check = "Route guards (canActivate)", InPlace = hasAuthGuard, Details = hasAuthGuard ? "Route guards detected protecting routes" : "No route guards found \u2014 authenticated routes are unprotected" });
+
+        var hasAuthInterceptor = FileContainsBoth(@"implements\s+HttpInterceptor|HttpInterceptorFn", @"(authorization|bearer|auth[_-]?token|x-auth)");
+        posture.Add(new SecurityPostureItem { Area = "Authentication", Check = "Auth token interceptor", InPlace = hasAuthInterceptor, Details = hasAuthInterceptor ? "HTTP interceptor handles auth tokens" : "No auth interceptor \u2014 tokens must be manually added to each request" });
+
+        var hasRoleCheck = FileContains(@"(role|permission|isAdmin|hasRole|canAccess)");
+        posture.Add(new SecurityPostureItem { Area = "Authentication", Check = "Role/permission checks", InPlace = hasRoleCheck, Details = hasRoleCheck ? "Role-based access patterns detected" : "No role-based access control patterns detected" });
+
+        // XSS Protection
+        var indexHtml = FindFile(appPath, "index.html");
+        var hasCsp = indexHtml is not null && File.ReadAllText(indexHtml).Contains("Content-Security-Policy", StringComparison.OrdinalIgnoreCase);
+        posture.Add(new SecurityPostureItem { Area = "XSS Protection", Check = "Content Security Policy", InPlace = hasCsp, Details = hasCsp ? "CSP header/meta tag found in index.html" : "No CSP configured \u2014 XSS attack surface is larger" });
+
+        var hasSanitization = FileContains(@"DomSanitizer");
+        posture.Add(new SecurityPostureItem { Area = "XSS Protection", Check = "DomSanitizer usage", InPlace = hasSanitization, Details = hasSanitization ? "DomSanitizer is used for safe HTML/URL handling" : "No DomSanitizer usage detected" });
+
+        // CSRF
+        var hasCsrf = FileContains(@"(X-XSRF-TOKEN|X-CSRF-TOKEN|HttpClientXsrfModule|withXsrfConfiguration|xsrfHeaderName)");
+        posture.Add(new SecurityPostureItem { Area = "CSRF Protection", Check = "CSRF/XSRF token handling", InPlace = hasCsrf, Details = hasCsrf ? "CSRF token handling detected" : "No CSRF protection \u2014 vulnerable to cross-site request forgery" });
+
+        // Error Handling
+        var hasErrorInterceptor = FileContainsBoth(@"implements\s+HttpInterceptor|HttpInterceptorFn", @"(catchError|HttpErrorResponse)");
+        posture.Add(new SecurityPostureItem { Area = "Error Handling", Check = "HTTP error interceptor", InPlace = hasErrorInterceptor, Details = hasErrorInterceptor ? "Centralized HTTP error handling detected" : "No error interceptor \u2014 errors may leak server details" });
+
+        var hasGlobalErrorHandler = FileContains(@"implements\s+ErrorHandler");
+        posture.Add(new SecurityPostureItem { Area = "Error Handling", Check = "Global ErrorHandler", InPlace = hasGlobalErrorHandler, Details = hasGlobalErrorHandler ? "Custom ErrorHandler implementation found" : "Using default ErrorHandler \u2014 unhandled errors logged to console" });
+
+        // Input Validation
+        var hasReactiveForms = FileContains(@"(FormBuilder|FormGroup|FormControl|Validators\.)");
+        posture.Add(new SecurityPostureItem { Area = "Input Validation", Check = "Reactive forms validation", InPlace = hasReactiveForms, Details = hasReactiveForms ? "Reactive forms with validators detected" : "No reactive form validation found" });
+
+        // Supply Chain
+        var hasLockFile = File.Exists(Path.Combine(appPath, "package-lock.json")) || File.Exists(Path.Combine(appPath, "yarn.lock")) || File.Exists(Path.Combine(appPath, "pnpm-lock.yaml"));
+        posture.Add(new SecurityPostureItem { Area = "Supply Chain", Check = "Dependency lock file", InPlace = hasLockFile, Details = hasLockFile ? "Lock file ensures reproducible builds" : "No lock file \u2014 vulnerable to supply chain attacks" });
+
+        // Configuration
+        var envDir = Path.Combine(appPath, "src", "environments");
+        var hasEnvSep = Directory.Exists(envDir) && Directory.GetFiles(envDir, "*.ts").Length >= 2;
+        posture.Add(new SecurityPostureItem { Area = "Configuration", Check = "Environment separation", InPlace = hasEnvSep, Details = hasEnvSep ? "Separate environment files for dev/prod" : "Missing environment separation" });
+
+        // Code Quality
+        var tsconfigPath = Path.Combine(appPath, "tsconfig.json");
+        var hasStrict = File.Exists(tsconfigPath) && Regex.IsMatch(File.ReadAllText(tsconfigPath), @"""strict""\s*:\s*true");
+        posture.Add(new SecurityPostureItem { Area = "Code Quality", Check = "TypeScript strict mode", InPlace = hasStrict, Details = hasStrict ? "Strict type checking enabled" : "Strict mode disabled \u2014 weaker type safety" });
+
+        var hasLinter = report.ProjectMetadata.DevDependencies.ContainsKey("eslint") || report.ProjectMetadata.DevDependencies.ContainsKey("@angular-eslint/builder");
+        posture.Add(new SecurityPostureItem { Area = "Code Quality", Check = "Linter configured", InPlace = hasLinter, Details = hasLinter ? "ESLint/angular-eslint configured" : "No linter \u2014 no automated code quality checks" });
+
+        // Transport Security
+        var hasInsecureUrls = tsFiles.Any(f => { try { return Regex.IsMatch(File.ReadAllText(f), @"['""`]http://(?!localhost)"); } catch { return false; } });
+        posture.Add(new SecurityPostureItem { Area = "Transport Security", Check = "HTTPS-only API calls", InPlace = !hasInsecureUrls, Details = !hasInsecureUrls ? "All detected API URLs use HTTPS (or localhost)" : "HTTP (non-HTTPS) API URLs detected" });
+
+        // Subscription Management
+        var hasCleanup = FileContains(@"(takeUntil|takeUntilDestroyed|unsubscribe|DestroyRef|AsyncPipe)");
+        posture.Add(new SecurityPostureItem { Area = "Resource Management", Check = "Subscription cleanup", InPlace = hasCleanup, Details = hasCleanup ? "Subscription cleanup patterns detected" : "No subscription cleanup \u2014 potential memory leaks" });
+
+        return posture;
+    }
+
+    // ───────────────────────────────────────────────────────────
     // Console Summary
     // ───────────────────────────────────────────────────────────
 
@@ -997,6 +1277,49 @@ internal class Program
                 Console.WriteLine($"      {icon} [{f.Category}] {f.Title}");
                 if (!string.IsNullOrEmpty(f.File))
                     Console.WriteLine($"         📄 {f.File}{(f.Line > 0 ? $":{f.Line}" : "")}");
+            }
+        }
+
+        // Security posture
+        if (report.SecurityPosture.Count > 0)
+        {
+            Console.WriteLine($"\n   🔐 Security Posture:");
+            foreach (var item in report.SecurityPosture)
+            {
+                var icon = item.InPlace ? "✅" : "❌";
+                Console.ForegroundColor = item.InPlace ? ConsoleColor.Green : ConsoleColor.Red;
+                Console.WriteLine($"      {icon} [{item.Area}] {item.Check}");
+                Console.ResetColor();
+            }
+        }
+
+        // API endpoints
+        if (report.ApiEndpoints.Count > 0)
+        {
+            Console.WriteLine($"\n   🌐 Discovered API Endpoints ({report.ApiEndpoints.Count}):");
+            foreach (var ep in report.ApiEndpoints.GroupBy(e => e.Url).Take(15))
+            {
+                var methods = string.Join("/", ep.Select(e => e.HttpMethod).Distinct());
+                Console.WriteLine($"      {methods,-8} {ep.Key}");
+            }
+            if (report.ApiEndpoints.GroupBy(e => e.Url).Count() > 15)
+                Console.WriteLine($"      ... and {report.ApiEndpoints.GroupBy(e => e.Url).Count() - 15} more");
+        }
+
+        // Library versions
+        if (report.LibraryVersions.Count > 0)
+        {
+            var majors = report.LibraryVersions.Where(v => v.UpdateType == "major").ToList();
+            if (majors.Count > 0)
+            {
+                Console.WriteLine($"\n   🔄 Major Version Updates Available ({majors.Count}):");
+                foreach (var v in majors.Take(10))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Write($"      {v.Name}");
+                    Console.ResetColor();
+                    Console.WriteLine($"  {v.Current} → {v.Latest}");
+                }
             }
         }
     }
@@ -1071,6 +1394,18 @@ internal class Program
         html.AppendLine("    .deps-table th { background:#34495e; color:#fff; padding:10px 14px; text-align:left; font-size:13px; }");
         html.AppendLine("    .deps-table td { padding:8px 14px; border-bottom:1px solid #ecf0f1; font-size:13px; }");
         html.AppendLine("    .deps-table tr:hover { background:#f8f9fa; }");
+        html.AppendLine("    .posture-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:12px; }");
+        html.AppendLine("    .posture-item { display:flex; align-items:center; gap:12px; padding:14px; background:#fff; border-radius:8px; border:1px solid #e9ecef; }");
+        html.AppendLine("    .posture-item.pass { border-left:4px solid var(--low); }");
+        html.AppendLine("    .posture-item.fail { border-left:4px solid var(--critical); }");
+        html.AppendLine("    .posture-icon { font-size:22px; }");
+        html.AppendLine("    .posture-check { font-weight:600; font-size:14px; }");
+        html.AppendLine("    .posture-area { font-size:11px; color:#95a5a6; text-transform:uppercase; letter-spacing:.5px; }");
+        html.AppendLine("    .posture-detail { font-size:12px; color:#7f8c8d; margin-top:2px; }");
+        html.AppendLine("    .endpoint-method { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:700; color:#fff; min-width:55px; text-align:center; }");
+        html.AppendLine("    .method-GET { background:#27ae60; } .method-POST { background:#2980b9; } .method-PUT { background:#e67e22; } .method-DELETE { background:#e74c3c; } .method-PATCH { background:#8e44ad; } .method-FETCH { background:#7f8c8d; }");
+        html.AppendLine("    .version-badge { display:inline-block; padding:2px 10px; border-radius:10px; font-size:11px; font-weight:600; }");
+        html.AppendLine("    .version-major { background:#fde8e8; color:#c0392b; } .version-minor { background:#fff3cd; color:#856404; } .version-patch { background:#d4edda; color:#155724; }");
         html.AppendLine("  </style>");
         html.AppendLine("</head>");
         html.AppendLine("<body>");
@@ -1090,6 +1425,75 @@ internal class Program
         html.AppendLine($"      <div class='summary-card low'><div class='number'>{lowCount}</div><div class='label'>Low</div></div>");
         html.AppendLine($"      <div class='summary-card'><div class='number'>{allFindings.Count}</div><div class='label'>Total</div></div>");
         html.AppendLine("    </div>");
+
+        // Security Posture Scorecard
+        if (report.SecurityPosture.Count > 0)
+        {
+            var passCount = report.SecurityPosture.Count(p => p.InPlace);
+            var failCount = report.SecurityPosture.Count(p => !p.InPlace);
+            html.AppendLine("    <div class='section'>");
+            html.AppendLine("      <div class='section-header' onclick='toggleSection(\"posture\")'>");
+            html.AppendLine("        <div><h2>\ud83d\udd10 Security Posture</h2></div>");
+            html.AppendLine($"        <div><span class='section-badge badge-low'>{passCount} in place</span><span class='section-badge badge-critical'>{failCount} missing</span><span class='toggle' id='toggle-posture'>\u25b6</span></div>");
+            html.AppendLine("      </div>");
+            html.AppendLine("      <div class='section-content show' id='content-posture'>");
+            html.AppendLine("        <div class='posture-grid'>");
+            foreach (var item in report.SecurityPosture)
+            {
+                var cls = item.InPlace ? "pass" : "fail";
+                var icon = item.InPlace ? "\u2705" : "\u274c";
+                html.AppendLine($"          <div class='posture-item {cls}'>");
+                html.AppendLine($"            <div class='posture-icon'>{icon}</div>");
+                html.AppendLine($"            <div><div class='posture-area'>{Escape(item.Area)}</div><div class='posture-check'>{Escape(item.Check)}</div><div class='posture-detail'>{Escape(item.Details)}</div></div>");
+                html.AppendLine($"          </div>");
+            }
+            html.AppendLine("        </div>");
+            html.AppendLine("      </div>");
+            html.AppendLine("    </div>");
+        }
+
+        // API Endpoints
+        if (report.ApiEndpoints.Count > 0)
+        {
+            html.AppendLine("    <div class='section'>");
+            html.AppendLine("      <div class='section-header' onclick='toggleSection(\"endpoints\")'>");
+            html.AppendLine("        <div><h2>\ud83c\udf10 Discovered API Endpoints</h2></div>");
+            html.AppendLine($"        <div><span class='section-badge badge-info'>{report.ApiEndpoints.Count} call(s)</span><span class='toggle' id='toggle-endpoints'>\u25b6</span></div>");
+            html.AppendLine("      </div>");
+            html.AppendLine("      <div class='section-content' id='content-endpoints'>");
+            html.AppendLine("        <table class='deps-table'><thead><tr><th>Method</th><th>URL / Pattern</th><th>Service</th><th>File</th><th>Line</th></tr></thead><tbody>");
+            foreach (var ep in report.ApiEndpoints.OrderBy(e => e.Url).ThenBy(e => e.HttpMethod))
+            {
+                var methodClass = $"method-{ep.HttpMethod}";
+                html.AppendLine($"          <tr><td><span class='endpoint-method {methodClass}'>{Escape(ep.HttpMethod)}</span></td><td><code>{Escape(ep.Url)}</code></td><td>{Escape(ep.ServiceName)}</td><td>{Escape(ep.File ?? "")}</td><td>{ep.Line}</td></tr>");
+            }
+            html.AppendLine("        </tbody></table>");
+            html.AppendLine("      </div>");
+            html.AppendLine("    </div>");
+        }
+
+        // Library Versions (npm outdated)
+        if (report.LibraryVersions.Count > 0)
+        {
+            var majorCount = report.LibraryVersions.Count(v => v.UpdateType == "major");
+            html.AppendLine("    <div class='section'>");
+            html.AppendLine("      <div class='section-header' onclick='toggleSection(\"versions\")'>");
+            html.AppendLine("        <div><h2>\ud83d\udd04 Library Versions (npm outdated)</h2></div>");
+            html.AppendLine($"        <div>");
+            if (majorCount > 0) html.AppendLine($"          <span class='section-badge badge-critical'>{majorCount} major</span>");
+            html.AppendLine($"          <span class='section-badge badge-info'>{report.LibraryVersions.Count} outdated</span><span class='toggle' id='toggle-versions'>\u25b6</span></div>");
+            html.AppendLine("      </div>");
+            html.AppendLine("      <div class='section-content' id='content-versions'>");
+            html.AppendLine("        <table class='deps-table'><thead><tr><th>Package</th><th>Current</th><th>Wanted</th><th>Latest</th><th>Update</th></tr></thead><tbody>");
+            foreach (var v in report.LibraryVersions.OrderByDescending(v => v.UpdateType == "major").ThenBy(v => v.Name))
+            {
+                var badgeClass = v.UpdateType switch { "major" => "version-major", "minor" => "version-minor", _ => "version-patch" };
+                html.AppendLine($"          <tr><td><strong>{Escape(v.Name)}</strong></td><td>{Escape(v.Current)}</td><td>{Escape(v.Wanted)}</td><td>{Escape(v.Latest)}</td><td><span class='version-badge {badgeClass}'>{Escape(v.UpdateType)}</span></td></tr>");
+            }
+            html.AppendLine("        </tbody></table>");
+            html.AppendLine("      </div>");
+            html.AppendLine("    </div>");
+        }
 
         // Category sections
         var categories = new[] { "Security", "Storage", "API Communication", "Application Design", "Libraries" };
@@ -1296,6 +1700,9 @@ internal class Program
         public List<Finding> ApiFindings { get; set; } = [];
         public List<Finding> DesignFindings { get; set; } = [];
         public List<Finding> LibraryFindings { get; set; } = [];
+        public List<LibraryVersionInfo> LibraryVersions { get; set; } = [];
+        public List<ApiEndpointInfo> ApiEndpoints { get; set; } = [];
+        public List<SecurityPostureItem> SecurityPosture { get; set; } = [];
 
         public IEnumerable<Finding> AllFindings =>
             SecurityFindings
@@ -1339,4 +1746,30 @@ internal class Program
     }
 
     record SecurityPattern(string Pattern, string Title, string Description, Severity Severity, string Category);
+
+    class LibraryVersionInfo
+    {
+        public string Name { get; set; } = "";
+        public string Current { get; set; } = "";
+        public string Wanted { get; set; } = "";
+        public string Latest { get; set; } = "";
+        public string UpdateType { get; set; } = "unknown";
+    }
+
+    class ApiEndpointInfo
+    {
+        public string HttpMethod { get; set; } = "";
+        public string Url { get; set; } = "";
+        public string? File { get; set; }
+        public int Line { get; set; }
+        public string ServiceName { get; set; } = "";
+    }
+
+    class SecurityPostureItem
+    {
+        public string Area { get; set; } = "";
+        public string Check { get; set; } = "";
+        public bool InPlace { get; set; }
+        public string Details { get; set; } = "";
+    }
 }
