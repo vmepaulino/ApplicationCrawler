@@ -1,3 +1,4 @@
 <Solution>
+  <Project Path="AngularAppAnalyser/AngularAppAnalyser.csproj" Id="19ce9b67-254f-44f2-990b-b93e2fd50c38" />
   <Project Path="DotNetCrawler/DotNetCrawler.csproj" Id="6a008037-5a72-48e4-b2d0-9aa88082826a" />
 </Solution>
